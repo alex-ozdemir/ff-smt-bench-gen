@@ -326,7 +326,6 @@ fn main() {
     let t = opts.sample_bool_term();
     let formula = zok::ZokReferenceCompiler::generate(&t, &FieldT::FBls12381, opts.try_break);
     let formula = circ::ir::opt::cfold::fold(&formula, &[]);
-    println!("{}", text::serialize_term(&formula));
     let f = std::fs::File::create("out.smt2").unwrap();
     circ::target::smt::write_smt2(f, &formula);
 }
