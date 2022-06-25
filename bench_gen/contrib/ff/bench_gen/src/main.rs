@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::time::{Duration, Instant};
 
+use circ::front::FrontEnd;
 use circ::ir::term::*;
 use circ::term;
 use circ_fields::FieldT;
@@ -53,8 +54,9 @@ struct Options {
 arg_enum! {
     #[derive(PartialEq, Debug)]
     enum Toolchain {
-        ZokReference,
+        ZokRef,
         ZokCirC,
+        CirC,
     }
 }
 
@@ -179,11 +181,11 @@ trait Compiler {
 mod zok {
     use super::*;
 
-    pub struct ZokReferenceCompiler;
+    pub struct ZokRef;
 
-    impl Compiler for ZokReferenceCompiler {
+    impl Compiler for ZokRef {
         fn compile(t: &Term, field: &FieldT, try_break: bool) -> CompilerOutput {
-            std::fs::write("z.zok", zok::zok_code(&t)).unwrap();
+            std::fs::write("z.zok", zok_code(&t)).unwrap();
             std::process::Command::new("zokrates")
                 .args(["compile", "-i", "z.zok", "-o", "out"])
                 .spawn()
@@ -198,7 +200,8 @@ mod zok {
                 .unwrap();
             let mut vars: Vec<String> = extras::free_variables(t.clone()).into_iter().collect();
             vars.sort();
-            let (ff_inputs, ff_assert, ff_ret, constraints) = zok::parse_ztf("out.ztf", field, try_break);
+            let (ff_inputs, ff_assert, ff_ret, constraints) =
+                zok::parse_ztf("out.ztf", field, try_break);
             CompilerOutput {
                 bool_vars_to_ff_vars: vars.into_iter().zip(ff_inputs).collect(),
                 output_var: ff_ret,
@@ -325,7 +328,11 @@ mod zok {
     }
 
     /// Returns (ff input variables, assertion term, ff output variable)
-    pub fn parse_ztf(path: &str, field: &FieldT, drop_final: bool) -> (Vec<String>, Term, String, usize) {
+    pub fn parse_ztf(
+        path: &str,
+        field: &FieldT,
+        drop_final: bool,
+    ) -> (Vec<String>, Term, String, usize) {
         let contents = std::fs::read_to_string(path).unwrap();
         let mut lines = contents.lines().vcollect();
         lines.reverse();
@@ -351,9 +358,9 @@ mod zok {
 
 mod circ_ {
     use super::*;
-    pub struct CirCZokCompiler;
 
-    impl Compiler for CirCZokCompiler {
+    pub struct CirC;
+    impl Compiler for CirC {
         fn compile(bool_term: &Term, field: &FieldT, try_break: bool) -> CompilerOutput {
             //println!("{}", extras::Letified(bool_term.clone()));
             let is_right =
@@ -420,6 +427,63 @@ mod circ_ {
         let i = r1cs_var_name.rfind('_').unwrap();
         r1cs_var_name[..i].into()
     }
+
+    pub struct CirCZok;
+    impl Compiler for CirCZok {
+        fn compile(bool_term: &Term, field: &FieldT, try_break: bool) -> CompilerOutput {
+            if std::env::var("ZSHARP_STDLIB_PATH").is_err() {
+                eprintln!("Warning: ZSHARP_STDLIB_PATH is not set. This may cause an error.");
+            }
+            println!("{}", extras::Letified(bool_term.clone()));
+            std::fs::write("z.zok", zok::zok_code(&bool_term)).unwrap();
+            let inputs = circ::front::zsharp::Inputs {
+                file: "z.zok".into(),
+                mode: circ::front::Mode::Proof,
+                isolate_asserts: false,
+            };
+            let c = circ::front::zsharp::ZSharpFE::gen(inputs);
+            let (r1cs, _, _) = circ::target::r1cs::trans::to_r1cs(c, field.clone());
+            let r1cs = circ::target::r1cs::opt::reduce_linearities(r1cs, Some(50));
+            let constraints = r1cs.constraints().len();
+            let r1cs_term = r1cs.ir_term();
+            println!("{}", extras::Letified(r1cs_term.clone()));
+            dbg!(extras::free_variables(r1cs_term.clone()));
+            let bool_vars = extras::free_variables(bool_term.clone());
+            let base_vars_to_r1cs_vars: HashMap<String, String> =
+                extras::free_variables(r1cs_term.clone())
+                    .into_iter()
+                    .map(|r1csv| (r1cs_var_name_to_orig_var_name(&r1csv), r1csv))
+                    .filter(|(b, _)| bool_vars.contains(b))
+                    .collect();
+            let output_var = extras::free_variables(r1cs_term.clone())
+                .into_iter()
+                .find(|v| r1cs_var_name_to_orig_var_name(v) == "return")
+                .unwrap();
+            let assertion = if try_break {
+                match &r1cs_term.op {
+                    &AND if r1cs_term.cs.len() > 1 => term(
+                        AND,
+                        r1cs_term
+                            .cs
+                            .iter()
+                            .take(r1cs_term.cs.len() - 1)
+                            .cloned()
+                            .collect(),
+                    ),
+                    _ => r1cs_term,
+                }
+            } else {
+                r1cs_term
+            };
+            //println!("{}", extras::Letified(assertion.clone()));
+            CompilerOutput {
+                bool_vars_to_ff_vars: base_vars_to_r1cs_vars,
+                output_var,
+                assertion,
+                constraints,
+            }
+        }
+    }
 }
 
 fn main() {
@@ -430,12 +494,9 @@ fn main() {
     let opts = Options::from_args();
     let t = opts.sample_bool_term();
     let gen = match opts.toolchain {
-        Toolchain::ZokReference => {
-            zok::ZokReferenceCompiler::generate(&t, &FieldT::FBls12381, opts.try_break)
-        }
-        Toolchain::ZokCirC => {
-            circ_::CirCZokCompiler::generate(&t, &FieldT::FBls12381, opts.try_break)
-        }
+        Toolchain::ZokRef => zok::ZokRef::generate(&t, &FieldT::FBls12381, opts.try_break),
+        Toolchain::ZokCirC => circ_::CirCZok::generate(&t, &FieldT::FBls12381, opts.try_break),
+        Toolchain::CirC => circ_::CirC::generate(&t, &FieldT::FBls12381, opts.try_break),
     };
     let formula = circ::ir::opt::cfold::fold(&gen.should_be_unsat, &[]);
     println!("constraints: {}", gen.constraints);

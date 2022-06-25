@@ -272,6 +272,8 @@ dependencies = [
  "serde_json",
  "thiserror",
  "typed-arena",
+ "zokrates_parser",
+ "zokrates_pest_ast",
 ]
 
 [[package]]
@@ -1384,4 +1386,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "129e027ad65ce1453680623c3fb5163cbf7107bfe1aa32257e7d0e63f9ced188"
 dependencies = [
  "tap",
+]
+
+[[package]]
+name = "zokrates_parser"
+version = "0.2.4"
+source = "git+https://github.com/circify/circ.git?branch=master#8bd4dbaeede68be052e64c04cf00ebf25d470f42"
+dependencies = [
+ "pest",
+ "pest_derive",
+]
+
+[[package]]
+name = "zokrates_pest_ast"
+version = "0.2.3"
+source = "git+https://github.com/circify/circ.git?branch=master#8bd4dbaeede68be052e64c04cf00ebf25d470f42"
+dependencies = [
+ "from-pest",
+ "lazy_static",
+ "pest",
+ "pest-ast",
+ "zokrates_parser",
 ]
