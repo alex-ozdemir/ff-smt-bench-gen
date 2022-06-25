@@ -26,7 +26,7 @@ struct Options {
     #[structopt(
         long,
         default_value = "0.7",
-        help = "Probability of adding an extra argument to an n-ary operator"
+        help = "Prob. of adding an extra argument to an n-ary operator"
     )]
     nary_arg_geo_param: f64,
     #[structopt(long, help = "Omit constant terms (true and false)")]
@@ -36,11 +36,9 @@ struct Options {
         help = "Try to break compilation, e.g., by dropping a constraint"
     )]
     try_break: bool,
-    #[structopt(
-        short = "o",
-        long,
-        help = "Operators to omit. Options: => not ite and or xor ="
-    )]
+    #[structopt(long, help = "Enable CirC optimizations")]
+    circ_opt: bool,
+    #[structopt(short = "o", long, help = "Operators to omit: => not ite and or xor =")]
     omit_ops: Vec<String>,
     #[structopt(
         short = "t",
@@ -133,7 +131,7 @@ struct GeneratorOutput {
 }
 
 trait Compiler {
-    fn compile(bool_term: &Term, field: &FieldT, try_break: bool) -> CompilerOutput;
+    fn compile(&self, bool_term: &Term, field: &FieldT, try_break: bool) -> CompilerOutput;
 
     /// Generate a term that is SAT when the compilation is unsound.
     ///
@@ -142,9 +140,9 @@ trait Compiler {
     /// * `bool_term`: the term to compile
     /// * `field`: the field to compile it in
     /// * `try_break`: whether to try to break compilation, e.g. by omitting a constraint
-    fn generate(bool_term: &Term, field: &FieldT, try_break: bool) -> GeneratorOutput {
+    fn generate(&self, bool_term: &Term, field: &FieldT, try_break: bool) -> GeneratorOutput {
         let start = Instant::now();
-        let o = Self::compile(bool_term, field, try_break);
+        let o = self.compile(bool_term, field, try_break);
         let compile_time = start.elapsed();
         let inputs_are_encoded = term(
             AND,
@@ -184,7 +182,7 @@ mod zok {
     pub struct ZokRef;
 
     impl Compiler for ZokRef {
-        fn compile(t: &Term, field: &FieldT, try_break: bool) -> CompilerOutput {
+        fn compile(&self, t: &Term, field: &FieldT, try_break: bool) -> CompilerOutput {
             std::fs::write("z.zok", zok_code(&t)).unwrap();
             std::process::Command::new("zokrates")
                 .args(["compile", "-i", "z.zok", "-o", "out"])
@@ -220,9 +218,9 @@ mod zok {
         for v in &vars {
             i += 1;
             if i == 1 {
-                write!(&mut out, "bool {}", v).unwrap();
+                write!(&mut out, "private bool {}", v).unwrap();
             } else {
-                write!(&mut out, ", bool {}", v).unwrap();
+                write!(&mut out, ", private bool {}", v).unwrap();
             }
         }
         writeln!(&mut out, ") -> bool:").unwrap();
@@ -359,9 +357,9 @@ mod zok {
 mod circ_ {
     use super::*;
 
-    pub struct CirC;
+    pub struct CirC(pub bool);
     impl Compiler for CirC {
-        fn compile(bool_term: &Term, field: &FieldT, try_break: bool) -> CompilerOutput {
+        fn compile(&self, bool_term: &Term, field: &FieldT, try_break: bool) -> CompilerOutput {
             //println!("{}", extras::Letified(bool_term.clone()));
             let is_right =
                 term![EQ; bool_term.clone(), leaf_term(Op::Var("return".into(), Sort::Bool))];
@@ -380,6 +378,34 @@ mod circ_ {
                 );
             }
             c.outputs.push(is_right);
+            let c = if self.0 {
+                c
+            } else {
+                use circ::ir::opt::Opt;
+                circ::ir::opt::opt(
+                    c,
+                    vec![
+                        Opt::ScalarizeVars,
+                        Opt::Flatten,
+                        Opt::Sha,
+                        Opt::ConstantFold(Box::new([])),
+                        Opt::Flatten,
+                        Opt::Inline,
+                        // Tuples must be eliminated before oblivious array elim
+                        Opt::Tuple,
+                        Opt::ConstantFold(Box::new([])),
+                        Opt::Obliv,
+                        // The obliv elim pass produces more tuples, that must be eliminated
+                        Opt::Tuple,
+                        Opt::LinearScan,
+                        // The linear scan pass produces more tuples, that must be eliminated
+                        Opt::Tuple,
+                        Opt::Flatten,
+                        Opt::ConstantFold(Box::new([])),
+                        Opt::Inline,
+                    ],
+                )
+            };
             let (r1cs, _, _) = circ::target::r1cs::trans::to_r1cs(c, field.clone());
             let r1cs = circ::target::r1cs::opt::reduce_linearities(r1cs, Some(50));
             let constraints = r1cs.constraints().len();
@@ -428,9 +454,9 @@ mod circ_ {
         r1cs_var_name[..i].into()
     }
 
-    pub struct CirCZok;
+    pub struct CirCZok(pub bool);
     impl Compiler for CirCZok {
-        fn compile(bool_term: &Term, field: &FieldT, try_break: bool) -> CompilerOutput {
+        fn compile(&self, bool_term: &Term, field: &FieldT, try_break: bool) -> CompilerOutput {
             if std::env::var("ZSHARP_STDLIB_PATH").is_err() {
                 eprintln!("Warning: ZSHARP_STDLIB_PATH is not set. This may cause an error.");
             }
@@ -442,6 +468,34 @@ mod circ_ {
                 isolate_asserts: false,
             };
             let c = circ::front::zsharp::ZSharpFE::gen(inputs);
+            let c = if self.0 {
+                c
+            } else {
+                use circ::ir::opt::Opt;
+                circ::ir::opt::opt(
+                    c,
+                    vec![
+                        Opt::ScalarizeVars,
+                        Opt::Flatten,
+                        Opt::Sha,
+                        Opt::ConstantFold(Box::new([])),
+                        Opt::Flatten,
+                        Opt::Inline,
+                        // Tuples must be eliminated before oblivious array elim
+                        Opt::Tuple,
+                        Opt::ConstantFold(Box::new([])),
+                        Opt::Obliv,
+                        // The obliv elim pass produces more tuples, that must be eliminated
+                        Opt::Tuple,
+                        Opt::LinearScan,
+                        // The linear scan pass produces more tuples, that must be eliminated
+                        Opt::Tuple,
+                        Opt::Flatten,
+                        Opt::ConstantFold(Box::new([])),
+                        Opt::Inline,
+                    ],
+                )
+            };
             let (r1cs, _, _) = circ::target::r1cs::trans::to_r1cs(c, field.clone());
             let r1cs = circ::target::r1cs::opt::reduce_linearities(r1cs, Some(50));
             let constraints = r1cs.constraints().len();
@@ -494,9 +548,13 @@ fn main() {
     let opts = Options::from_args();
     let t = opts.sample_bool_term();
     let gen = match opts.toolchain {
-        Toolchain::ZokRef => zok::ZokRef::generate(&t, &FieldT::FBls12381, opts.try_break),
-        Toolchain::ZokCirC => circ_::CirCZok::generate(&t, &FieldT::FBls12381, opts.try_break),
-        Toolchain::CirC => circ_::CirC::generate(&t, &FieldT::FBls12381, opts.try_break),
+        Toolchain::ZokRef => zok::ZokRef.generate(&t, &FieldT::FBls12381, opts.try_break),
+        Toolchain::ZokCirC => {
+            circ_::CirCZok(opts.circ_opt).generate(&t, &FieldT::FBls12381, opts.try_break)
+        }
+        Toolchain::CirC => {
+            circ_::CirC(opts.circ_opt).generate(&t, &FieldT::FBls12381, opts.try_break)
+        }
     };
     let formula = circ::ir::opt::cfold::fold(&gen.should_be_unsat, &[]);
     println!("constraints: {}", gen.constraints);
