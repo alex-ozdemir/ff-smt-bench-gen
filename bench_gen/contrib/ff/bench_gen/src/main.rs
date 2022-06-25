@@ -1,3 +1,4 @@
+use structopt::clap::arg_enum;
 use structopt::StructOpt;
 
 use rand::{distributions::Distribution, distributions::WeightedIndex, seq::SliceRandom};
@@ -5,6 +6,7 @@ use rand_distr::Geometric;
 
 use std::collections::HashMap;
 use std::fmt::Write;
+use std::time::{Duration, Instant};
 
 use circ::ir::term::*;
 use circ::term;
@@ -39,6 +41,21 @@ struct Options {
         help = "Operators to omit. Options: => not ite and or xor ="
     )]
     omit_ops: Vec<String>,
+    #[structopt(
+        short = "t",
+        long,
+        help = "Toolchain to use",
+        default_value = "ZokCirC"
+    )]
+    toolchain: Toolchain,
+}
+
+arg_enum! {
+    #[derive(PartialEq, Debug)]
+    enum Toolchain {
+        ZokReference,
+        ZokCirC,
+    }
 }
 
 impl Options {
@@ -104,6 +121,13 @@ struct CompilerOutput {
     bool_vars_to_ff_vars: HashMap<String, String>,
     output_var: String,
     assertion: Term,
+    constraints: usize,
+}
+
+struct GeneratorOutput {
+    should_be_unsat: Term,
+    compile_time: Duration,
+    constraints: usize,
 }
 
 trait Compiler {
@@ -116,8 +140,10 @@ trait Compiler {
     /// * `bool_term`: the term to compile
     /// * `field`: the field to compile it in
     /// * `try_break`: whether to try to break compilation, e.g. by omitting a constraint
-    fn generate(bool_term: &Term, field: &FieldT, try_break: bool) -> Term {
+    fn generate(bool_term: &Term, field: &FieldT, try_break: bool) -> GeneratorOutput {
+        let start = Instant::now();
         let o = Self::compile(bool_term, field, try_break);
+        let compile_time = start.elapsed();
         let inputs_are_encoded = term(
             AND,
             o.bool_vars_to_ff_vars
@@ -137,12 +163,16 @@ trait Compiler {
         );
         let output_as_bool = term(EQ, vec![pf_lit(field.new_v(1)), output]);
         let output_agrees = term(EQ, vec![output_as_bool, bool_term.clone()]);
-        term!(NOT;
-            term!(IMPLIES;
-                term(AND, vec![inputs_are_encoded, o.assertion]),
-                term(AND, vec![output_is_boolean, output_agrees])
-            )
-        )
+        GeneratorOutput {
+            should_be_unsat: term!(NOT;
+                term!(IMPLIES;
+                    term(AND, vec![inputs_are_encoded, o.assertion]),
+                    term(AND, vec![output_is_boolean, output_agrees])
+                )
+            ),
+            compile_time,
+            constraints: o.constraints,
+        }
     }
 }
 
@@ -168,11 +198,12 @@ mod zok {
                 .unwrap();
             let mut vars: Vec<String> = extras::free_variables(t.clone()).into_iter().collect();
             vars.sort();
-            let (ff_inputs, ff_assert, ff_ret) = zok::parse_ztf("out.ztf", field, try_break);
+            let (ff_inputs, ff_assert, ff_ret, constraints) = zok::parse_ztf("out.ztf", field, try_break);
             CompilerOutput {
                 bool_vars_to_ff_vars: vars.into_iter().zip(ff_inputs).collect(),
                 output_var: ff_ret,
                 assertion: ff_assert,
+                constraints,
             }
         }
     }
@@ -294,7 +325,7 @@ mod zok {
     }
 
     /// Returns (ff input variables, assertion term, ff output variable)
-    pub fn parse_ztf(path: &str, field: &FieldT, drop_final: bool) -> (Vec<String>, Term, String) {
+    pub fn parse_ztf(path: &str, field: &FieldT, drop_final: bool) -> (Vec<String>, Term, String, usize) {
         let contents = std::fs::read_to_string(path).unwrap();
         let mut lines = contents.lines().vcollect();
         lines.reverse();
@@ -310,10 +341,84 @@ mod zok {
                 constraints.push(parse_constraint(l, field));
             }
         }
+        let n = constraints.len();
         if drop_final {
             constraints.pop();
         }
-        (vars, term(AND, constraints), "out".into())
+        (vars, term(AND, constraints), "out".into(), n)
+    }
+}
+
+mod circ_ {
+    use super::*;
+    pub struct CirCZokCompiler;
+
+    impl Compiler for CirCZokCompiler {
+        fn compile(bool_term: &Term, field: &FieldT, try_break: bool) -> CompilerOutput {
+            //println!("{}", extras::Letified(bool_term.clone()));
+            let is_right =
+                term![EQ; bool_term.clone(), leaf_term(Op::Var("return".into(), Sort::Bool))];
+            //println!("{}", extras::Letified(is_right.clone()));
+            let mut c = Computation::default();
+            for v in extras::free_variables(is_right.clone()) {
+                c.new_var(
+                    &v,
+                    Sort::Bool,
+                    if v == "return" {
+                        None
+                    } else {
+                        Some(circ::ir::proof::PROVER_ID)
+                    },
+                    None,
+                );
+            }
+            c.outputs.push(is_right);
+            let (r1cs, _, _) = circ::target::r1cs::trans::to_r1cs(c, field.clone());
+            let r1cs = circ::target::r1cs::opt::reduce_linearities(r1cs, Some(50));
+            let constraints = r1cs.constraints().len();
+            let r1cs_term = r1cs.ir_term();
+            //println!("{}", extras::Letified(r1cs_term.clone()));
+            //dbg!(extras::free_variables(r1cs_term.clone()));
+            let bool_vars = extras::free_variables(bool_term.clone());
+            let base_vars_to_r1cs_vars: HashMap<String, String> =
+                extras::free_variables(r1cs_term.clone())
+                    .into_iter()
+                    .map(|r1csv| (r1cs_var_name_to_orig_var_name(&r1csv), r1csv))
+                    .filter(|(b, _)| bool_vars.contains(b))
+                    .collect();
+            let output_var = extras::free_variables(r1cs_term.clone())
+                .into_iter()
+                .find(|v| r1cs_var_name_to_orig_var_name(v) == "return")
+                .unwrap();
+            let assertion = if try_break {
+                match &r1cs_term.op {
+                    &AND if r1cs_term.cs.len() > 1 => term(
+                        AND,
+                        r1cs_term
+                            .cs
+                            .iter()
+                            .take(r1cs_term.cs.len() - 1)
+                            .cloned()
+                            .collect(),
+                    ),
+                    _ => r1cs_term,
+                }
+            } else {
+                r1cs_term
+            };
+            //println!("{}", extras::Letified(assertion.clone()));
+            CompilerOutput {
+                bool_vars_to_ff_vars: base_vars_to_r1cs_vars,
+                output_var,
+                assertion,
+                constraints,
+            }
+        }
+    }
+
+    fn r1cs_var_name_to_orig_var_name(r1cs_var_name: &str) -> String {
+        let i = r1cs_var_name.rfind('_').unwrap();
+        r1cs_var_name[..i].into()
     }
 }
 
@@ -324,8 +429,17 @@ fn main() {
         .init();
     let opts = Options::from_args();
     let t = opts.sample_bool_term();
-    let formula = zok::ZokReferenceCompiler::generate(&t, &FieldT::FBls12381, opts.try_break);
-    let formula = circ::ir::opt::cfold::fold(&formula, &[]);
+    let gen = match opts.toolchain {
+        Toolchain::ZokReference => {
+            zok::ZokReferenceCompiler::generate(&t, &FieldT::FBls12381, opts.try_break)
+        }
+        Toolchain::ZokCirC => {
+            circ_::CirCZokCompiler::generate(&t, &FieldT::FBls12381, opts.try_break)
+        }
+    };
+    let formula = circ::ir::opt::cfold::fold(&gen.should_be_unsat, &[]);
+    println!("constraints: {}", gen.constraints);
+    println!("comp   time: {}", gen.compile_time.as_secs_f64());
     let f = std::fs::File::create("out.smt2").unwrap();
     circ::target::smt::write_smt2(f, &formula);
 }
