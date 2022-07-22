@@ -339,7 +339,7 @@ mod zok {
         let header_line = lines.pop().unwrap();
         assert!(header_line.starts_with("def main"));
         let header_toks = header_line.split(&['(', ')']).vcollect();
-        let vars = header_toks[1].split(", ").map(String::from).vcollect();
+        let vars = header_toks[1].split(", ").map(|s| s.trim_start_matches("private ").into()).vcollect();
         let mut constraints = Vec::new();
         while let Some(l) = lines.pop() {
             if !(l.trim().starts_with("return") || l.trim().starts_with('#')) {
