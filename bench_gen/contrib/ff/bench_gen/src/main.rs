@@ -1,11 +1,12 @@
-use structopt::clap::arg_enum;
-use structopt::StructOpt;
-
 use rand::{distributions::Distribution, distributions::WeightedIndex, seq::SliceRandom};
 use rand_distr::Geometric;
+use rug::Integer;
+use structopt::StructOpt;
+use structopt::clap::arg_enum;
 
 use std::collections::HashMap;
 use std::fmt::Write;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use circ::front::FrontEnd;
@@ -38,6 +39,8 @@ struct Options {
     try_break: bool,
     #[structopt(long, help = "Enable CirC optimizations")]
     circ_opt: bool,
+    #[structopt(long, default_value = "255", help = "How many bits in the field. Uses the first prime in that range, or, for 255 bits, Bls12-381's scalar field")]
+    field_bits: u16,
     #[structopt(short = "o", long, help = "Operators to omit: => not ite and or xor =")]
     omit_ops: Vec<String>,
     #[structopt(
@@ -540,6 +543,19 @@ mod circ_ {
     }
 }
 
+// Get the first prime field of `bits` bits.
+// If bits is 255, gets Bls12-381's scalar field instead.
+fn get_field(bits: u16) -> FieldT {
+    assert!(bits >= 2, "The number of prime bits must be >=2");
+    if bits == 255 { FieldT::FBls12381 } else {
+        let mut i = Integer::from(1u8);
+        i <<= bits as u32;
+        i -= 1;
+        i.next_prime_mut();
+        FieldT::IntField(Arc::new(i))
+    }
+}
+
 fn main() {
     env_logger::Builder::from_default_env()
         .format_level(false)
@@ -547,13 +563,14 @@ fn main() {
         .init();
     let opts = Options::from_args();
     let t = opts.sample_bool_term();
+    let field = get_field(opts.field_bits);
     let gen = match opts.toolchain {
-        Toolchain::ZokRef => zok::ZokRef.generate(&t, &FieldT::FBls12381, opts.try_break),
+        Toolchain::ZokRef => zok::ZokRef.generate(&t, &field, opts.try_break),
         Toolchain::ZokCirC => {
-            circ_::CirCZok(opts.circ_opt).generate(&t, &FieldT::FBls12381, opts.try_break)
+            circ_::CirCZok(opts.circ_opt).generate(&t, &field, opts.try_break)
         }
         Toolchain::CirC => {
-            circ_::CirC(opts.circ_opt).generate(&t, &FieldT::FBls12381, opts.try_break)
+            circ_::CirC(opts.circ_opt).generate(&t, &field, opts.try_break)
         }
     };
     let formula = circ::ir::opt::cfold::fold(&gen.should_be_unsat, &[]);
