@@ -242,7 +242,7 @@ checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
 [[package]]
 name = "circ"
 version = "0.1.0"
-source = "git+https://github.com/circify/circ.git?branch=master#2d0709342ed08834cd53cfde3e3a82e13e6a065e"
+source = "git+https://github.com/circify/circ.git?branch=master#0b3c936a40e91f4ff40c8d22ee9703f1075ed561"
 dependencies = [
  "bellman",
  "bincode",
@@ -279,7 +279,7 @@ dependencies = [
 [[package]]
 name = "circ_fields"
 version = "0.1.0"
-source = "git+https://github.com/circify/circ.git?branch=master#2d0709342ed08834cd53cfde3e3a82e13e6a065e"
+source = "git+https://github.com/circify/circ.git?branch=master#0b3c936a40e91f4ff40c8d22ee9703f1075ed561"
 dependencies = [
  "ff",
  "ff-derive-num",
@@ -1391,7 +1391,7 @@ dependencies = [
 [[package]]
 name = "zokrates_parser"
 version = "0.2.4"
-source = "git+https://github.com/circify/circ.git?branch=master#2d0709342ed08834cd53cfde3e3a82e13e6a065e"
+source = "git+https://github.com/circify/circ.git?branch=master#0b3c936a40e91f4ff40c8d22ee9703f1075ed561"
 dependencies = [
  "pest",
  "pest_derive",
@@ -1400,7 +1400,7 @@ dependencies = [
 [[package]]
 name = "zokrates_pest_ast"
 version = "0.2.3"
-source = "git+https://github.com/circify/circ.git?branch=master#2d0709342ed08834cd53cfde3e3a82e13e6a065e"
+source = "git+https://github.com/circify/circ.git?branch=master#0b3c936a40e91f4ff40c8d22ee9703f1075ed561"
 dependencies = [
  "from-pest",
  "lazy_static",

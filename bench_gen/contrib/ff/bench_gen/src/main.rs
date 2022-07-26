@@ -1,8 +1,8 @@
 use rand::{distributions::Distribution, distributions::WeightedIndex, seq::SliceRandom};
 use rand_distr::Geometric;
 use rug::Integer;
-use structopt::StructOpt;
 use structopt::clap::arg_enum;
+use structopt::StructOpt;
 
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -39,7 +39,11 @@ struct Options {
     try_break: bool,
     #[structopt(long, help = "Enable CirC optimizations")]
     circ_opt: bool,
-    #[structopt(long, default_value = "255", help = "How many bits in the field. Uses the first prime in that range, or, for 255 bits, Bls12-381's scalar field")]
+    #[structopt(
+        long,
+        default_value = "255",
+        help = "How many bits in the field. Uses the first prime in that range, or, for 255 bits, Bls12-381's scalar field"
+    )]
     field_bits: u16,
     #[structopt(short = "o", long, help = "Operators to omit: => not ite and or xor =")]
     omit_ops: Vec<String>,
@@ -50,6 +54,12 @@ struct Options {
         default_value = "ZokCirC"
     )]
     toolchain: Toolchain,
+    #[structopt(
+        long,
+        help = "Logic to use",
+        default_value = "FF"
+    )]
+    logic: Logic,
 }
 
 arg_enum! {
@@ -58,6 +68,15 @@ arg_enum! {
         ZokRef,
         ZokCirC,
         CirC,
+    }
+}
+
+arg_enum! {
+    #[derive(PartialEq, Debug)]
+    enum Logic {
+        FF,
+        BV,
+        NIA,
     }
 }
 
@@ -342,7 +361,10 @@ mod zok {
         let header_line = lines.pop().unwrap();
         assert!(header_line.starts_with("def main"));
         let header_toks = header_line.split(&['(', ')']).vcollect();
-        let vars = header_toks[1].split(", ").map(|s| s.trim_start_matches("private ").into()).vcollect();
+        let vars = header_toks[1]
+            .split(", ")
+            .map(|s| s.trim_start_matches("private ").into())
+            .vcollect();
         let mut constraints = Vec::new();
         while let Some(l) = lines.pop() {
             if !(l.trim().starts_with("return") || l.trim().starts_with('#')) {
@@ -547,13 +569,49 @@ mod circ_ {
 // If bits is 255, gets Bls12-381's scalar field instead.
 fn get_field(bits: u16) -> FieldT {
     assert!(bits >= 2, "The number of prime bits must be >=2");
-    if bits == 255 { FieldT::FBls12381 } else {
+    if bits == 255 {
+        FieldT::FBls12381
+    } else {
         let mut i = Integer::from(1u8);
         i <<= bits as u32;
         i -= 1;
         i.next_prime_mut();
         FieldT::IntField(Arc::new(i))
     }
+}
+
+// Convert all field terms to bit-vectors. Requires all field terms to have field `f`.
+fn pf_to_bv(formula: Term, f: &FieldT) -> Term {
+    let f_bits = f.modulus().significant_bits() as usize;
+    let bv_sort = Sort::BitVector(2 * f_bits);
+    let bv_modulus = bv_lit(f.modulus(), 2 * f_bits);
+    let mut cache: TermMap<Term> = TermMap::new();
+    for t in PostOrderIter::new(formula.clone()) {
+        let cs: Vec<Term> = t.cs.iter().map(|c| cache.get(c).unwrap().clone()).collect();
+        let new = match &t.op {
+            Op::Const(Value::Field(c)) => {
+                assert_eq!(&c.ty(), f);
+                bv_lit(c.i(), 2 * f_bits)
+            }
+            Op::Var(name, Sort::Field(this_f)) => {
+                assert_eq!(this_f, f);
+                leaf_term(Op::Var(name.clone(), bv_sort.clone()))
+            }
+            Op::PfNaryOp(PfNaryOp::Add) => {
+                term![BV_UREM; term(BV_ADD, cs), bv_modulus.clone()]
+            }
+            Op::PfNaryOp(PfNaryOp::Mul) => {
+                let mut acc = cs[0].clone();
+                for i in cs.into_iter().skip(1) {
+                    acc = term![BV_UREM; term![BV_ADD; acc, i], bv_modulus.clone()];
+                }
+                acc
+            }
+            o => term(o.clone(), cs),
+        };
+        cache.insert(t.clone(), new);
+    }
+    cache.remove(&formula).unwrap()
 }
 
 fn main() {
@@ -566,16 +624,17 @@ fn main() {
     let field = get_field(opts.field_bits);
     let gen = match opts.toolchain {
         Toolchain::ZokRef => zok::ZokRef.generate(&t, &field, opts.try_break),
-        Toolchain::ZokCirC => {
-            circ_::CirCZok(opts.circ_opt).generate(&t, &field, opts.try_break)
-        }
-        Toolchain::CirC => {
-            circ_::CirC(opts.circ_opt).generate(&t, &field, opts.try_break)
-        }
+        Toolchain::ZokCirC => circ_::CirCZok(opts.circ_opt).generate(&t, &field, opts.try_break),
+        Toolchain::CirC => circ_::CirC(opts.circ_opt).generate(&t, &field, opts.try_break),
     };
-    let formula = circ::ir::opt::cfold::fold(&gen.should_be_unsat, &[]);
+    let formula = match opts.logic {
+        Logic::FF => gen.should_be_unsat.clone(),
+        Logic::BV => pf_to_bv(gen.should_be_unsat.clone(), &field),
+        Logic::NIA => unimplemented!(),
+    };
+    let opt_formula = circ::ir::opt::cfold::fold(&formula, &[]);
     println!("constraints: {}", gen.constraints);
     println!("comp   time: {}", gen.compile_time.as_secs_f64());
     let f = std::fs::File::create("out.smt2").unwrap();
-    circ::target::smt::write_smt2(f, &formula);
+    circ::target::smt::write_smt2(f, &opt_formula);
 }
