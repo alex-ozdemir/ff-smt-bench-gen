@@ -1,4 +1,6 @@
-use rand::{distributions::Distribution, distributions::WeightedIndex, seq::SliceRandom};
+use rand::{
+    distributions::Distribution, distributions::WeightedIndex, seq::SliceRandom, SeedableRng,
+};
 use rand_distr::Geometric;
 use rug::Integer;
 use structopt::clap::arg_enum;
@@ -54,12 +56,10 @@ struct Options {
         default_value = "ZokCirC"
     )]
     toolchain: Toolchain,
-    #[structopt(
-        long,
-        help = "Logic to use",
-        default_value = "FF"
-    )]
+    #[structopt(long, help = "Logic to use", default_value = "FF")]
     logic: Logic,
+    #[structopt(long, help = "for random generation")]
+    seed: Option<u64>,
 }
 
 arg_enum! {
@@ -94,21 +94,24 @@ impl Options {
             terms.push((0, terms.len(), leaf_term(Op::Const(Value::Bool(true)))));
             terms.push((0, terms.len(), leaf_term(Op::Const(Value::Bool(false)))));
         }
-        let rng = &mut rand::thread_rng();
+        let mut rng = rand::rngs::StdRng::from_entropy();
+        if let Some(s) = self.seed {
+            rng = rand::rngs::StdRng::seed_from_u64(s);
+        }
         let nary_arity_dist = Geometric::new(1.0 - self.nary_arg_geo_param).unwrap();
         let mut ops = vec![IMPLIES, NOT, XOR, AND, OR, EQ, ITE];
         ops.retain(|o| !self.omit_ops.contains(&format!("{}", o)));
         for _ in 0..(self.terms - 1) {
-            let op = ops.choose(rng).unwrap().clone();
+            let op = ops.choose(&mut rng).unwrap().clone();
             let arity = op.arity();
-            let n_args = arity.unwrap_or_else(|| 2 + nary_arity_dist.sample(rng) as usize);
+            let n_args = arity.unwrap_or_else(|| 2 + nary_arity_dist.sample(&mut rng) as usize);
             let mut args = Vec::new();
             for _ in 0..n_args {
                 let mut terms_cp = terms.clone();
                 let n = terms.len();
                 terms_cp.sort();
                 let weights: Vec<usize> = (0..n).map(|i| (n - i) * (n - i)).collect();
-                let choice = WeightedIndex::new(&weights).unwrap().sample(rng);
+                let choice = WeightedIndex::new(&weights).unwrap().sample(&mut rng);
                 let (_, i, t) = terms_cp[choice].clone();
                 args.push(t);
                 terms[i].0 += 1;
@@ -117,7 +120,7 @@ impl Options {
         }
         let mut nary_ops = vec![XOR, AND, OR];
         nary_ops.retain(|o| !self.omit_ops.contains(&format!("{}", o)));
-        let op = nary_ops.choose(rng).unwrap().clone();
+        let op = nary_ops.choose(&mut rng).unwrap().clone();
         term(
             op,
             terms
@@ -573,7 +576,7 @@ fn get_field(bits: u16) -> FieldT {
         FieldT::FBls12381
     } else {
         let mut i = Integer::from(1u8);
-        i <<= bits as u32;
+        i <<= bits as u32 - 1;
         i -= 1;
         i.next_prime_mut();
         FieldT::IntField(Arc::new(i))
@@ -586,6 +589,7 @@ fn pf_to_bv(formula: Term, f: &FieldT) -> Term {
     let bv_sort = Sort::BitVector(2 * f_bits);
     let bv_modulus = bv_lit(f.modulus(), 2 * f_bits);
     let mut cache: TermMap<Term> = TermMap::new();
+    let mut assertions = Vec::new();
     for t in PostOrderIter::new(formula.clone()) {
         let cs: Vec<Term> = t.cs.iter().map(|c| cache.get(c).unwrap().clone()).collect();
         let new = match &t.op {
@@ -595,7 +599,9 @@ fn pf_to_bv(formula: Term, f: &FieldT) -> Term {
             }
             Op::Var(name, Sort::Field(this_f)) => {
                 assert_eq!(this_f, f);
-                leaf_term(Op::Var(name.clone(), bv_sort.clone()))
+                let v = leaf_term(Op::Var(name.clone(), bv_sort.clone()));
+                assertions.push(term![BV_ULT; v.clone(), bv_modulus.clone()]);
+                v
             }
             Op::PfNaryOp(PfNaryOp::Add) => {
                 term![BV_UREM; term(BV_ADD, cs), bv_modulus.clone()]
@@ -603,7 +609,7 @@ fn pf_to_bv(formula: Term, f: &FieldT) -> Term {
             Op::PfNaryOp(PfNaryOp::Mul) => {
                 let mut acc = cs[0].clone();
                 for i in cs.into_iter().skip(1) {
-                    acc = term![BV_UREM; term![BV_ADD; acc, i], bv_modulus.clone()];
+                    acc = term![BV_UREM; term![BV_MUL; acc, i], bv_modulus.clone()];
                 }
                 acc
             }
@@ -611,7 +617,53 @@ fn pf_to_bv(formula: Term, f: &FieldT) -> Term {
         };
         cache.insert(t.clone(), new);
     }
-    cache.remove(&formula).unwrap()
+    assertions.push(cache.remove(&formula).unwrap());
+    term(AND, assertions)
+}
+
+// Convert all field terms to integers. Requires all field terms to have field `f`.
+fn pf_to_nia(formula: Term, f: &FieldT) -> Term {
+    let int_modulus = leaf_term(Op::Const(Value::Int(f.modulus().clone())));
+    let int_zero = leaf_term(Op::Const(Value::Int(Integer::new())));
+    let mut quotient_i = 0;
+    let mut remainder_i = 0;
+    let mut assertions = Vec::new();
+    let mut assertions2 = Vec::new();
+    let mut normalize = |t: Term| {
+        let q = leaf_term(Op::Var(format!("embed_q{}", quotient_i), Sort::Int));
+        let r = leaf_term(Op::Var(format!("embed_r{}", remainder_i), Sort::Int));
+        quotient_i += 1;
+        remainder_i += 1;
+        assertions.push(term![INT_GE; r.clone(), int_zero.clone()]);
+        assertions.push(term![INT_LT; r.clone(), int_modulus.clone()]);
+        assertions
+            .push(term![EQ; t, term![INT_ADD; term![INT_MUL; q, int_modulus.clone()], r.clone()]]);
+        r
+    };
+    let mut cache: TermMap<Term> = TermMap::new();
+    for t in PostOrderIter::new(formula.clone()) {
+        let cs: Vec<Term> = t.cs.iter().map(|c| cache.get(c).unwrap().clone()).collect();
+        let new = match &t.op {
+            Op::Const(Value::Field(c)) => {
+                assert_eq!(&c.ty(), f);
+                leaf_term(Op::Const(Value::Int(c.i().clone())))
+            }
+            Op::Var(name, Sort::Field(this_f)) => {
+                assert_eq!(this_f, f);
+                let v = leaf_term(Op::Var(name.clone(), Sort::Int));
+                assertions2.push(term![INT_LT; v.clone(), int_modulus.clone()]);
+                assertions2.push(term![INT_GE; v.clone(), int_zero.clone()]);
+                v
+            }
+            Op::PfNaryOp(PfNaryOp::Add) => normalize(term(INT_ADD, cs)),
+            Op::PfNaryOp(PfNaryOp::Mul) => normalize(term(INT_MUL, cs)),
+            o => term(o.clone(), cs),
+        };
+        cache.insert(t.clone(), new);
+    }
+    assertions.extend(assertions2);
+    assertions.push(cache.remove(&formula).unwrap());
+    term(AND, assertions)
 }
 
 fn main() {
@@ -630,7 +682,7 @@ fn main() {
     let formula = match opts.logic {
         Logic::FF => gen.should_be_unsat.clone(),
         Logic::BV => pf_to_bv(gen.should_be_unsat.clone(), &field),
-        Logic::NIA => unimplemented!(),
+        Logic::NIA => pf_to_nia(gen.should_be_unsat.clone(), &field),
     };
     let opt_formula = circ::ir::opt::cfold::fold(&formula, &[]);
     println!("constraints: {}", gen.constraints);
