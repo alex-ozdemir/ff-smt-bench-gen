@@ -77,6 +77,7 @@ arg_enum! {
         FF,
         BV,
         NIA,
+        PureFf,
     }
 }
 
@@ -666,6 +667,89 @@ fn pf_to_nia(formula: Term, f: &FieldT) -> Term {
     term(AND, assertions)
 }
 
+fn pf_bool_neg(t: Term) -> Term {
+    if let Sort::Field(f) = check(&t) {
+        term![PF_ADD; pf_lit(f.new_v(1)), term![PF_NEG; t]]
+    } else {
+        panic!()
+    }
+}
+
+// Convert all boolean terms to the field.
+fn bool_to_pf(formula: Term, f: &FieldT) -> Term {
+    let f_sort = Sort::Field(f.clone());
+    let mut cache: TermMap<Term> = TermMap::new();
+    let mut assertions = Vec::new();
+    let mut ct = 0;
+    let mut fresh = || {
+        let v = leaf_term(Op::Var(format!("embed_i{}", ct), f_sort.clone()));
+        ct += 1;
+        v
+    };
+    for t in PostOrderIter::new(formula.clone()) {
+        let cs: Vec<Term> = t.cs.iter().map(|c| cache.get(c).unwrap().clone()).collect();
+        println!("t: {:?}\n  c: {:#?}", t, cs);
+        let new = match &t.op {
+            Op::Const(Value::Bool(b)) => pf_lit(f.new_v(*b as u8)),
+            Op::Var(name, Sort::Bool) => {
+                let v = leaf_term(Op::Var(name.clone(), f_sort.clone()));
+                assertions.push(term![EQ; term![PF_MUL; v.clone(), v.clone()], v.clone()]);
+                v
+            }
+            Op::BoolNaryOp(BoolNaryOp::And) => term(PF_MUL, cs),
+            Op::BoolNaryOp(BoolNaryOp::Or) => {
+                pf_bool_neg(term(PF_MUL, cs.into_iter().map(pf_bool_neg).collect()))
+            }
+            Op::BoolNaryOp(o) => {
+                unimplemented!("{}", o)
+            }
+            Op::Implies => pf_bool_neg(term![PF_MUL; cs[0].clone(), pf_bool_neg(cs[1].clone())]),
+            Op::Eq => {
+                match check(&t.cs[0]) {
+                    Sort::Bool => {
+                        // 1 - x - y + 2 * xy
+                        term![PF_ADD;
+                            pf_lit(f.new_v(1)),
+                            term![PF_NEG; cs[0].clone()],
+                            term![PF_NEG; cs[1].clone()],
+                            term![PF_MUL; pf_lit(f.new_v(2)), cs[0].clone(), cs[1].clone()]
+                        ]
+                    }
+                    Sort::Field(ff) => {
+                        assert_eq!(&ff, f);
+                        // m (x - y) = 1 - r
+                        // r (x - y) = 0
+                        let m = fresh();
+                        let r = fresh();
+                        let d = term![PF_ADD; cs[0].clone(), term![PF_NEG; cs[1].clone()]];
+                        assertions.push(term![EQ; term![PF_MUL; m.clone(), d.clone()], pf_bool_neg(r.clone())]);
+                        assertions.push(
+                            term![EQ; term![PF_MUL; r.clone(), d.clone()], pf_lit(f.new_v(0))],
+                        );
+                        r
+                    }
+                    _ => unimplemented!(),
+                }
+            }
+            Op::Ite => {
+                // 1 - x - y + 2 * xy
+                term![PF_ADD;
+                    cs[2].clone(),
+                    term![PF_MUL;
+                        cs[0].clone(),
+                        term![PF_ADD;
+                            cs[1].clone(),
+                            term![PF_NEG; cs[2].clone()]]]]
+            }
+            Op::Not => pf_bool_neg(cs[0].clone()),
+            o => term(o.clone(), cs),
+        };
+        cache.insert(t.clone(), new);
+    }
+    assertions.push(term![EQ; cache.remove(&formula).unwrap(), pf_lit(f.new_v(1))]);
+    term(AND, assertions)
+}
+
 fn main() {
     env_logger::Builder::from_default_env()
         .format_level(false)
@@ -683,6 +767,7 @@ fn main() {
         Logic::FF => gen.should_be_unsat.clone(),
         Logic::BV => pf_to_bv(gen.should_be_unsat.clone(), &field),
         Logic::NIA => pf_to_nia(gen.should_be_unsat.clone(), &field),
+        Logic::PureFf => bool_to_pf(gen.should_be_unsat.clone(), &field),
     };
     let opt_formula = circ::ir::opt::cfold::fold(&formula, &[]);
     println!("constraints: {}", gen.constraints);
