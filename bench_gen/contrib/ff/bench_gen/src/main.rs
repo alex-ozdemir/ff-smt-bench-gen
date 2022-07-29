@@ -389,10 +389,8 @@ mod circ_ {
     pub struct CirC(pub bool);
     impl Compiler for CirC {
         fn compile(&self, bool_term: &Term, field: &FieldT, try_break: bool) -> CompilerOutput {
-            //println!("{}", extras::Letified(bool_term.clone()));
             let is_right =
                 term![EQ; bool_term.clone(), leaf_term(Op::Var("return".into(), Sort::Bool))];
-            //println!("{}", extras::Letified(is_right.clone()));
             let mut c = Computation::default();
             for v in extras::free_variables(is_right.clone()) {
                 c.new_var(
@@ -439,8 +437,6 @@ mod circ_ {
             let r1cs = circ::target::r1cs::opt::reduce_linearities(r1cs, Some(50));
             let constraints = r1cs.constraints().len();
             let r1cs_term = r1cs.ir_term();
-            //println!("{}", extras::Letified(r1cs_term.clone()));
-            //dbg!(extras::free_variables(r1cs_term.clone()));
             let bool_vars = extras::free_variables(bool_term.clone());
             let base_vars_to_r1cs_vars: HashMap<String, String> =
                 extras::free_variables(r1cs_term.clone())
@@ -468,7 +464,6 @@ mod circ_ {
             } else {
                 r1cs_term
             };
-            //println!("{}", extras::Letified(assertion.clone()));
             CompilerOutput {
                 bool_vars_to_ff_vars: base_vars_to_r1cs_vars,
                 output_var,
@@ -489,7 +484,6 @@ mod circ_ {
             if std::env::var("ZSHARP_STDLIB_PATH").is_err() {
                 eprintln!("Warning: ZSHARP_STDLIB_PATH is not set. This may cause an error.");
             }
-            println!("{}", extras::Letified(bool_term.clone()));
             std::fs::write("z.zok", zok::zok_code(&bool_term)).unwrap();
             let inputs = circ::front::zsharp::Inputs {
                 file: "z.zok".into(),
@@ -529,8 +523,6 @@ mod circ_ {
             let r1cs = circ::target::r1cs::opt::reduce_linearities(r1cs, Some(50));
             let constraints = r1cs.constraints().len();
             let r1cs_term = r1cs.ir_term();
-            println!("{}", extras::Letified(r1cs_term.clone()));
-            dbg!(extras::free_variables(r1cs_term.clone()));
             let bool_vars = extras::free_variables(bool_term.clone());
             let base_vars_to_r1cs_vars: HashMap<String, String> =
                 extras::free_variables(r1cs_term.clone())
@@ -558,7 +550,6 @@ mod circ_ {
             } else {
                 r1cs_term
             };
-            //println!("{}", extras::Letified(assertion.clone()));
             CompilerOutput {
                 bool_vars_to_ff_vars: base_vars_to_r1cs_vars,
                 output_var,
@@ -688,7 +679,6 @@ fn bool_to_pf(formula: Term, f: &FieldT) -> Term {
     };
     for t in PostOrderIter::new(formula.clone()) {
         let cs: Vec<Term> = t.cs.iter().map(|c| cache.get(c).unwrap().clone()).collect();
-        println!("t: {:?}\n  c: {:#?}", t, cs);
         let new = match &t.op {
             Op::Const(Value::Bool(b)) => pf_lit(f.new_v(*b as u8)),
             Op::Var(name, Sort::Bool) => {
