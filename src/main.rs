@@ -456,11 +456,9 @@ mod circ_ {
                 )
             };
             let (mut r1cs, _, _) = circ::target::r1cs::trans::to_r1cs(c, field.clone());
-            dbg!(&r1cs);
             if self.1 {
                 r1cs = circ::target::r1cs::opt::reduce_linearities(r1cs, Some(50));
             }
-            dbg!(&r1cs);
             let constraints = r1cs.constraints().len();
             let r1cs_term = r1cs.ir_term();
             let bool_vars = extras::free_variables(bool_term.clone());
