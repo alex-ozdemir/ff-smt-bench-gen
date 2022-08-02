@@ -41,8 +41,10 @@ struct Options {
         help = "Try to break compilation, e.g., by dropping a constraint"
     )]
     try_break: bool,
-    #[structopt(long, help = "Enable CirC optimizations")]
+    #[structopt(long, help = "Enable CirC IR optimizations")]
     circ_opt: bool,
+    #[structopt(long, help = "Enable CirC R1CS optimizations")]
+    circ_opt_r1cs: bool,
     #[structopt(
         long,
         default_value = "255",
@@ -267,9 +269,9 @@ mod zok {
         for v in &vars {
             i += 1;
             if i == 1 {
-                write!(&mut out, "private bool {}", v).unwrap();
+                write!(&mut out, "public bool {}", v).unwrap();
             } else {
-                write!(&mut out, ", private bool {}", v).unwrap();
+                write!(&mut out, ", public bool {}", v).unwrap();
             }
         }
         writeln!(&mut out, ") -> bool:").unwrap();
@@ -409,7 +411,7 @@ mod zok {
 mod circ_ {
     use super::*;
 
-    pub struct CirC(pub bool);
+    pub struct CirC(pub bool, pub bool);
     impl Compiler for CirC {
         fn compile(&self, bool_term: &Term, field: &FieldT, try_break: bool) -> CompilerOutput {
             let is_right =
@@ -419,11 +421,8 @@ mod circ_ {
                 c.new_var(
                     &v,
                     Sort::Bool,
-                    if v == "return" {
-                        None
-                    } else {
-                        Some(circ::ir::proof::PROVER_ID)
-                    },
+                    // public variables, so we don't optimize them out.
+                    None,
                     None,
                 );
             }
@@ -456,8 +455,12 @@ mod circ_ {
                     ],
                 )
             };
-            let (r1cs, _, _) = circ::target::r1cs::trans::to_r1cs(c, field.clone());
-            let r1cs = circ::target::r1cs::opt::reduce_linearities(r1cs, Some(50));
+            let (mut r1cs, _, _) = circ::target::r1cs::trans::to_r1cs(c, field.clone());
+            dbg!(&r1cs);
+            if self.1 {
+                r1cs = circ::target::r1cs::opt::reduce_linearities(r1cs, Some(50));
+            }
+            dbg!(&r1cs);
             let constraints = r1cs.constraints().len();
             let r1cs_term = r1cs.ir_term();
             let bool_vars = extras::free_variables(bool_term.clone());
@@ -501,7 +504,7 @@ mod circ_ {
         r1cs_var_name[..i].into()
     }
 
-    pub struct CirCZok(pub bool);
+    pub struct CirCZok(pub bool, pub bool);
     impl Compiler for CirCZok {
         fn compile(&self, bool_term: &Term, field: &FieldT, try_break: bool) -> CompilerOutput {
             if std::env::var("ZSHARP_STDLIB_PATH").is_err() {
@@ -542,8 +545,10 @@ mod circ_ {
                     ],
                 )
             };
-            let (r1cs, _, _) = circ::target::r1cs::trans::to_r1cs(c, field.clone());
-            let r1cs = circ::target::r1cs::opt::reduce_linearities(r1cs, Some(50));
+            let (mut r1cs, _, _) = circ::target::r1cs::trans::to_r1cs(c, field.clone());
+            if self.1 {
+                r1cs = circ::target::r1cs::opt::reduce_linearities(r1cs, Some(50));
+            }
             let constraints = r1cs.constraints().len();
             let r1cs_term = r1cs.ir_term();
             let bool_vars = extras::free_variables(bool_term.clone());
@@ -782,8 +787,12 @@ fn main() {
     let field = get_field(opts.field_bits);
     let gen = match opts.toolchain {
         Toolchain::ZokRef => zok::ZokRef.generate(&t, &field, opts.try_break),
-        Toolchain::ZokCirC => circ_::CirCZok(opts.circ_opt).generate(&t, &field, opts.try_break),
-        Toolchain::CirC => circ_::CirC(opts.circ_opt).generate(&t, &field, opts.try_break),
+        Toolchain::ZokCirC => {
+            circ_::CirCZok(opts.circ_opt, opts.circ_opt_r1cs).generate(&t, &field, opts.try_break)
+        }
+        Toolchain::CirC => {
+            circ_::CirC(opts.circ_opt, opts.circ_opt_r1cs).generate(&t, &field, opts.try_break)
+        }
     };
     let formula = match opts.logic {
         Logic::FF => gen.should_be_unsat.clone(),
