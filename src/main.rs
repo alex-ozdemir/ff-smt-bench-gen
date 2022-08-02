@@ -66,7 +66,12 @@ struct Options {
     seed: Option<u64>,
     #[structopt(
         long,
-        help = "IR to compile. Takes precendence over random generation."
+        help = "Generate an n-ary operator. Takes precendence over random generation."
+    )]
+    gen_nary: Option<String>,
+    #[structopt(
+        long,
+        help = "IR to compile. Takes precendence over other generation procedures."
     )]
     ir: Option<String>,
     #[structopt(long, help = "Dump the IR to this file.")]
@@ -154,6 +159,25 @@ impl Options {
                 }
             }
             t
+        })
+    }
+    fn maybe_generate_nary(&self) -> Option<Term> {
+        self.gen_nary.as_ref().map(|name| {
+            let op = match name.as_str() {
+                "xor" => XOR,
+                "and" => AND,
+                "or" => OR,
+                _ => panic!(
+                    "Expected n-ary operator in ['and', 'or', 'xor'], got : {}",
+                    name
+                ),
+            };
+            term(
+                op,
+                (0..self.vars)
+                    .map(|i| leaf_term(Op::Var(format!("x{}", i), Sort::Bool)))
+                    .collect(),
+            )
         })
     }
 }
@@ -774,9 +798,10 @@ fn main() {
         .format_timestamp(None)
         .init();
     let opts = Options::from_args();
-    let t = opts
-        .maybe_read_ir_term()
-        .unwrap_or_else(|| opts.sample_bool_term());
+    let t = opts.maybe_generate_nary().unwrap_or_else(|| {
+        opts.maybe_read_ir_term()
+            .unwrap_or_else(|| opts.sample_bool_term())
+    });
     if let Some(path) = opts.ir_output.as_ref() {
         let mut f = File::create(path).expect("could not open IR file");
         let s = text::serialize_term(&t);
