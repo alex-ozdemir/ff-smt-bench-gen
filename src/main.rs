@@ -7,11 +7,11 @@ use structopt::clap::arg_enum;
 use structopt::StructOpt;
 
 use std::collections::HashMap;
-use std::fmt::Write;
+use std::fmt::Write as FmtWrite;
+use std::fs::File;
+use std::io::{Read, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::fs::File;
-use std::io::Read;
 
 use circ::front::FrontEnd;
 use circ::ir::term::*;
@@ -62,8 +62,13 @@ struct Options {
     logic: Logic,
     #[structopt(long, help = "for random generation")]
     seed: Option<u64>,
-    #[structopt(long, help = "IR to compile. Takes precendence over random generation.")]
+    #[structopt(
+        long,
+        help = "IR to compile. Takes precendence over random generation."
+    )]
     ir: Option<String>,
+    #[structopt(long, help = "Dump the IR to this file.")]
+    ir_output: Option<String>,
 }
 
 arg_enum! {
@@ -730,7 +735,9 @@ fn bool_to_pf(formula: Term, f: &FieldT) -> Term {
                         let m = fresh();
                         let r = fresh();
                         let d = term![PF_ADD; cs[0].clone(), term![PF_NEG; cs[1].clone()]];
-                        assertions.push(term![EQ; term![PF_MUL; m.clone(), d.clone()], pf_bool_neg(r.clone())]);
+                        assertions.push(
+                            term![EQ; term![PF_MUL; m.clone(), d.clone()], pf_bool_neg(r.clone())],
+                        );
                         assertions.push(
                             term![EQ; term![PF_MUL; r.clone(), d.clone()], pf_lit(f.new_v(0))],
                         );
@@ -764,7 +771,14 @@ fn main() {
         .format_timestamp(None)
         .init();
     let opts = Options::from_args();
-    let t = opts.maybe_read_ir_term().unwrap_or_else(|| opts.sample_bool_term());
+    let t = opts
+        .maybe_read_ir_term()
+        .unwrap_or_else(|| opts.sample_bool_term());
+    if let Some(path) = opts.ir_output.as_ref() {
+        let mut f = File::create(path).expect("could not open IR file");
+        let s = text::serialize_term(&t);
+        f.write_all(s.as_bytes()).unwrap();
+    }
     let field = get_field(opts.field_bits);
     let gen = match opts.toolchain {
         Toolchain::ZokRef => zok::ZokRef.generate(&t, &field, opts.try_break),
