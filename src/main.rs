@@ -10,6 +10,8 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::fs::File;
+use std::io::Read;
 
 use circ::front::FrontEnd;
 use circ::ir::term::*;
@@ -60,6 +62,8 @@ struct Options {
     logic: Logic,
     #[structopt(long, help = "for random generation")]
     seed: Option<u64>,
+    #[structopt(long, help = "IR to compile. Takes precendence over random generation.")]
+    ir: Option<String>,
 }
 
 arg_enum! {
@@ -130,6 +134,20 @@ impl Options {
                 .map(|i| i.2)
                 .collect(),
         )
+    }
+    fn maybe_read_ir_term(&self) -> Option<Term> {
+        self.ir.as_ref().map(|path| {
+            let mut f = File::open(path).expect("could not open IR file");
+            let mut bytes = Vec::new();
+            f.read_to_end(&mut bytes).unwrap();
+            let t = text::parse_term(&bytes);
+            for sub_t in PostOrderIter::new(t.clone()) {
+                if !matches!(check(&sub_t), Sort::Bool) {
+                    panic!("Non-boolean term {} in input IR", sub_t);
+                }
+            }
+            t
+        })
     }
 }
 
@@ -746,7 +764,7 @@ fn main() {
         .format_timestamp(None)
         .init();
     let opts = Options::from_args();
-    let t = opts.sample_bool_term();
+    let t = opts.maybe_read_ir_term().unwrap_or_else(|| opts.sample_bool_term());
     let field = get_field(opts.field_bits);
     let gen = match opts.toolchain {
         Toolchain::ZokRef => zok::ZokRef.generate(&t, &field, opts.try_break),
