@@ -60,6 +60,12 @@ struct Options {
         default_value = "ZokCirC"
     )]
     toolchain: Toolchain,
+    #[structopt(
+        long,
+        help = "Type of benchmark",
+        default_value = "sound"
+    )]
+    ty: Type,
     #[structopt(long, help = "Logic to use", default_value = "FF")]
     logic: Logic,
     #[structopt(long, help = "for random generation")]
@@ -76,6 +82,14 @@ struct Options {
     ir: Option<String>,
     #[structopt(long, help = "Dump the IR to this file.")]
     ir_output: Option<String>,
+}
+
+arg_enum! {
+    #[derive(PartialEq, Debug)]
+    enum Type {
+        Sound,
+        Deterministic,
+    }
 }
 
 arg_enum! {
@@ -215,7 +229,7 @@ trait Compiler {
     /// * `bool_term`: the term to compile
     /// * `field`: the field to compile it in
     /// * `try_break`: whether to try to break compilation, e.g. by omitting a constraint
-    fn generate(&self, bool_term: &Term, field: &FieldT, try_break: bool) -> GeneratorOutput {
+    fn gen_sound(&self, bool_term: &Term, field: &FieldT, try_break: bool) -> GeneratorOutput {
         let start = Instant::now();
         let o = self.compile(bool_term, field, try_break);
         let compile_time = start.elapsed();
@@ -244,6 +258,73 @@ trait Compiler {
                     term(AND, vec![inputs_are_encoded, o.assertion]),
                     term(AND, vec![output_is_boolean, output_agrees])
                 )
+            ),
+            compile_time,
+            constraints: o.constraints,
+        }
+    }
+
+    /// Generate a term that is SAT when the compilation non-deterministic.
+    ///
+    /// ## Arguments
+    ///
+    /// * `bool_term`: the term to compile
+    /// * `field`: the field to compile it in
+    /// * `try_break`: whether to try to break compilation, e.g. by omitting a constraint
+    fn gen_deterministic(
+        &self,
+        bool_term: &Term,
+        field: &FieldT,
+        try_break: bool,
+    ) -> GeneratorOutput {
+        let start = Instant::now();
+        let o = self.compile(bool_term, field, try_break);
+        let compile_time = start.elapsed();
+        let inputs_terms: Vec<Term> = o
+            .bool_vars_to_ff_vars
+            .iter()
+            .map(|(_, ffv)| leaf_term(Op::Var(ffv.clone(), Sort::Field(field.clone()))))
+            .collect();
+        let inputs_terms_alt: Vec<Term> = o
+            .bool_vars_to_ff_vars
+            .iter()
+            .map(|(_, ffv)| {
+                leaf_term(Op::Var(
+                    format!("{}_alt", ffv.clone()),
+                    Sort::Field(field.clone()),
+                ))
+            })
+            .collect();
+        let mut terms_alt: TermMap<Term> = TermMap::new();
+        for t in PostOrderIter::new(o.assertion.clone()) {
+            if let Op::Var(n, s) = &t.op {
+                terms_alt.insert(
+                    t.clone(),
+                    leaf_term(Op::Var(format!("{}_alt", n.clone()), s.clone())),
+                );
+            }
+        }
+        extras::substitute_cache(&o.assertion, &mut terms_alt);
+        let assertion_alt = terms_alt.get(&o.assertion).unwrap().clone();
+
+        let inputs_eq = term(
+            AND,
+            inputs_terms
+                .into_iter()
+                .zip(inputs_terms_alt)
+                .map(|(a, b)| term![EQ; a, b])
+                .collect(),
+        );
+        let outputs_differ = term![NOT; term![EQ;
+            leaf_term(Op::Var(format!("{}", o.output_var.clone()), Sort::Field(field.clone()))),
+            leaf_term(Op::Var(format!("{}_alt", o.output_var.clone()), Sort::Field(field.clone())))
+        ]];
+        GeneratorOutput {
+            should_be_unsat: term!(AND;
+                inputs_eq,
+                outputs_differ,
+                o.assertion,
+                assertion_alt
             ),
             compile_time,
             constraints: o.constraints,
@@ -808,14 +889,15 @@ fn main() {
         f.write_all(s.as_bytes()).unwrap();
     }
     let field = get_field(opts.field_bits);
-    let gen = match opts.toolchain {
-        Toolchain::ZokRef => zok::ZokRef.generate(&t, &field, opts.try_break),
-        Toolchain::ZokCirC => {
-            circ_::CirCZok(opts.circ_opt, opts.circ_opt_r1cs).generate(&t, &field, opts.try_break)
-        }
-        Toolchain::CirC => {
-            circ_::CirC(opts.circ_opt, opts.circ_opt_r1cs).generate(&t, &field, opts.try_break)
-        }
+    let toolchain: Box<dyn Compiler> = match opts.toolchain {
+        Toolchain::ZokRef =>Box::new(zok::ZokRef),
+        Toolchain::ZokCirC =>Box::new(circ_::CirCZok(opts.circ_opt, opts.circ_opt_r1cs)),
+        Toolchain::CirC =>Box::new(circ_::CirC(opts.circ_opt, opts.circ_opt_r1cs)),
+
+    };
+    let gen = match opts.ty {
+        Type::Sound => toolchain.gen_sound(&t, &field, opts.try_break),
+        Type::Deterministic => toolchain.gen_deterministic(&t, &field, opts.try_break),
     };
     let formula = match opts.logic {
         Logic::FF => gen.should_be_unsat.clone(),
