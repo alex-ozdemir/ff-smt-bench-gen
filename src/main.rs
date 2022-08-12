@@ -9,6 +9,7 @@ use structopt::StructOpt;
 use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
 use std::fs::File;
+use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -18,7 +19,7 @@ use circ::ir::term::*;
 use circ::term;
 use circ_fields::FieldT;
 
-#[derive(Debug, StructOpt)]
+#[derive(Debug, StructOpt, Hash)]
 #[structopt(
     name = "bench_gen",
     about = "Generate SMT2 benchmarks related to ff compilations of boolean computations"
@@ -30,10 +31,16 @@ struct Options {
     vars: usize,
     #[structopt(
         long,
-        default_value = "0.7",
+        default_value = "7",
         help = "Prob. of adding an extra argument to an n-ary operator"
     )]
-    nary_arg_geo_param: f64,
+    nary_arg_geo_param_num: usize,
+    #[structopt(
+        long,
+        default_value = "10",
+        help = "Prob. of adding an extra argument to an n-ary operator"
+    )]
+    nary_arg_geo_param_denom: usize,
     #[structopt(long, help = "Omit constant terms (true and false)")]
     no_consts: bool,
     #[structopt(
@@ -60,11 +67,7 @@ struct Options {
         default_value = "ZokCirC"
     )]
     toolchain: Toolchain,
-    #[structopt(
-        long,
-        help = "Type of benchmark",
-        default_value = "sound"
-    )]
+    #[structopt(long, help = "Type of benchmark", default_value = "sound")]
     ty: Type,
     #[structopt(long, help = "Logic to use", default_value = "FF")]
     logic: Logic,
@@ -85,7 +88,7 @@ struct Options {
 }
 
 arg_enum! {
-    #[derive(PartialEq, Debug)]
+    #[derive(PartialEq, Debug, Hash)]
     enum Type {
         Sound,
         Deterministic,
@@ -93,7 +96,7 @@ arg_enum! {
 }
 
 arg_enum! {
-    #[derive(PartialEq, Debug)]
+    #[derive(PartialEq, Debug, Hash)]
     enum Toolchain {
         ZokRef,
         ZokCirC,
@@ -102,7 +105,7 @@ arg_enum! {
 }
 
 arg_enum! {
-    #[derive(PartialEq, Debug)]
+    #[derive(PartialEq, Debug, Hash)]
     enum Logic {
         FF,
         BV,
@@ -126,10 +129,15 @@ impl Options {
             terms.push((0, terms.len(), leaf_term(Op::Const(Value::Bool(false)))));
         }
         let mut rng = rand::rngs::StdRng::from_entropy();
-        if let Some(s) = self.seed {
-            rng = rand::rngs::StdRng::seed_from_u64(s);
+        if let Some(_) = self.seed {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            self.hash(&mut hasher);
+            let actual_seed = hasher.finish();
+            rng = rand::rngs::StdRng::seed_from_u64(actual_seed);
         }
-        let nary_arity_dist = Geometric::new(1.0 - self.nary_arg_geo_param).unwrap();
+        let nary_arg_geo_param =
+            self.nary_arg_geo_param_num as f64 / self.nary_arg_geo_param_denom as f64;
+        let nary_arity_dist = Geometric::new(1.0 - nary_arg_geo_param).unwrap();
         let mut ops = vec![IMPLIES, NOT, XOR, AND, OR, EQ, ITE];
         ops.retain(|o| !self.omit_ops.contains(&format!("{}", o)));
         for _ in 0..(self.terms - 1) {
@@ -706,6 +714,84 @@ fn get_field(bits: u16) -> FieldT {
     }
 }
 
+fn bv_size(a: &Term) -> usize {
+    if let Sort::BitVector(m) = check(&a) {
+        m
+    } else {
+        panic!()
+    }
+}
+fn bv_safe_ext(a: Term, n: usize) -> Term {
+    let m = bv_size(&a);
+    if m < n {
+        term![Op::BvUext(n - m); a]
+    } else if m > n {
+        panic!()
+    } else {
+        a
+    }
+}
+
+fn bv_safe_add(ts: &[Term]) -> Term {
+    let max_w = ts.iter().map(|t| bv_size(t)).max().unwrap();
+    let n = max_w * ((ts.len() as f64).log2() as usize + 2);
+    term(
+        BV_ADD,
+        ts.iter().map(|t| bv_safe_ext(t.clone(), n)).collect(),
+    )
+}
+
+fn bv_safe_mul(a: Term, b: Term) -> Term {
+    let max_w = std::cmp::max(bv_size(&a), bv_size(&b));
+    let n = 2 * max_w;
+    term![BV_MUL; bv_safe_ext(a, n), bv_safe_ext(b, n)]
+}
+
+fn bv_safe_ff_eq(a: Term, b: Term, f: &FieldT) -> Term {
+    let n = std::cmp::max(bv_size(&a), bv_size(&b));
+    let modulus = bv_lit(f.modulus(), n);
+    let zero = bv_lit(0, n);
+    let diff = term![BV_SUB; bv_safe_ext(a, n), bv_safe_ext(b, n)];
+    term![EQ; term![BV_UREM; diff, modulus], zero]
+}
+
+// Convert all field terms to bit-vectors. Requires all field terms to have field `f`.
+//
+// Defers reductions to equality checks.
+#[allow(dead_code)]
+fn pf_to_bv_lazy(formula: Term, f: &FieldT) -> Term {
+    let f_bits = f.modulus().significant_bits() as usize;
+    let bv_sort = Sort::BitVector(f_bits);
+    let bv_modulus = bv_lit(f.modulus(), f_bits);
+    let mut cache: TermMap<Term> = TermMap::new();
+    let mut assertions = Vec::new();
+    for t in PostOrderIter::new(formula.clone()) {
+        let cs: Vec<Term> = t.cs.iter().map(|c| cache.get(c).unwrap().clone()).collect();
+        let new = match &t.op {
+            Op::Const(Value::Field(c)) => {
+                assert_eq!(&c.ty(), f);
+                bv_lit(c.i(), f_bits)
+            }
+            Op::Var(name, Sort::Field(this_f)) => {
+                assert_eq!(this_f, f);
+                let v = leaf_term(Op::Var(name.clone(), bv_sort.clone()));
+                assertions.push(term![BV_ULT; v.clone(), bv_modulus.clone()]);
+                v
+            }
+            Op::PfNaryOp(PfNaryOp::Add) => bv_safe_add(&cs),
+            Op::PfNaryOp(PfNaryOp::Mul) => cs.into_iter().reduce(|a, b| bv_safe_mul(a, b)).unwrap(),
+            Op::Eq => match check(&t.cs[0]) {
+                Sort::Field(_) => bv_safe_ff_eq(cs[0].clone(), cs[1].clone(), f),
+                _ => term(EQ, cs),
+            },
+            o => term(o.clone(), cs),
+        };
+        cache.insert(t.clone(), new);
+    }
+    assertions.push(cache.remove(&formula).unwrap());
+    term(AND, assertions)
+}
+
 // Convert all field terms to bit-vectors. Requires all field terms to have field `f`.
 fn pf_to_bv(formula: Term, f: &FieldT) -> Term {
     let f_bits = f.modulus().significant_bits() as usize;
@@ -798,14 +884,33 @@ fn pf_bool_neg(t: Term) -> Term {
 }
 
 // Convert all boolean terms to the field.
+//
+// Leaves top-level assertions as booleans.
+// Omits top-level assertions
 fn bool_to_pf(formula: Term, f: &FieldT) -> Term {
+    let mut ct = 0;
+    let formula = circ::ir::opt::flat::flatten_nary_ops(formula);
+    if &formula.op == &AND {
+        term(
+            AND,
+            formula
+                .cs
+                .iter()
+                .map(|t| bool_to_pf_pure(t.clone(), f, &mut ct))
+                .collect(),
+        )
+    } else {
+        bool_to_pf_pure(formula, f, &mut ct)
+    }
+}
+
+fn bool_to_pf_pure(formula: Term, f: &FieldT, ct: &mut usize) -> Term {
     let f_sort = Sort::Field(f.clone());
     let mut cache: TermMap<Term> = TermMap::new();
     let mut assertions = Vec::new();
-    let mut ct = 0;
     let mut fresh = || {
         let v = leaf_term(Op::Var(format!("embed_i{}", ct), f_sort.clone()));
-        ct += 1;
+        *ct += 1;
         v
     };
     for t in PostOrderIter::new(formula.clone()) {
@@ -890,10 +995,9 @@ fn main() {
     }
     let field = get_field(opts.field_bits);
     let toolchain: Box<dyn Compiler> = match opts.toolchain {
-        Toolchain::ZokRef =>Box::new(zok::ZokRef),
-        Toolchain::ZokCirC =>Box::new(circ_::CirCZok(opts.circ_opt, opts.circ_opt_r1cs)),
-        Toolchain::CirC =>Box::new(circ_::CirC(opts.circ_opt, opts.circ_opt_r1cs)),
-
+        Toolchain::ZokRef => Box::new(zok::ZokRef),
+        Toolchain::ZokCirC => Box::new(circ_::CirCZok(opts.circ_opt, opts.circ_opt_r1cs)),
+        Toolchain::CirC => Box::new(circ_::CirC(opts.circ_opt, opts.circ_opt_r1cs)),
     };
     let gen = match opts.ty {
         Type::Sound => toolchain.gen_sound(&t, &field, opts.try_break),
@@ -903,7 +1007,13 @@ fn main() {
         Logic::FF => gen.should_be_unsat.clone(),
         Logic::BV => pf_to_bv(gen.should_be_unsat.clone(), &field),
         Logic::NIA => pf_to_nia(gen.should_be_unsat.clone(), &field),
-        Logic::PureFf => bool_to_pf(gen.should_be_unsat.clone(), &field),
+        Logic::PureFf => {
+            if let Type::Deterministic = &opts.ty {
+                bool_to_pf(gen.should_be_unsat.clone(), &field)
+            } else {
+                bool_to_pf_pure(gen.should_be_unsat.clone(), &field, &mut 0)
+            }
+        }
     };
     let opt_formula = circ::ir::opt::cfold::fold(&formula, &[]);
     println!("constraints: {}", gen.constraints);
