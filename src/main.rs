@@ -1,5 +1,5 @@
 use rand::{
-    distributions::Distribution, distributions::WeightedIndex, seq::SliceRandom, SeedableRng,
+    distributions::Distribution, distributions::WeightedIndex, seq::SliceRandom, Rng, SeedableRng,
 };
 use rand_distr::Geometric;
 use rug::Integer;
@@ -11,10 +11,12 @@ use std::fmt::Write as FmtWrite;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use circ::front::FrontEnd;
+use circ::ir::opt::cfold::fold;
 use circ::ir::term::*;
 use circ::term;
 use circ_fields::FieldT;
@@ -115,7 +117,15 @@ arg_enum! {
 }
 
 impl Options {
-    fn sample_bool_term(&self) -> Term {
+    fn seed_rng<R: SeedableRng>(&self, rng: &mut R) {
+        if let Some(_) = self.seed {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            self.hash(&mut hasher);
+            let actual_seed = hasher.finish();
+            *rng = R::seed_from_u64(actual_seed);
+        }
+    }
+    fn sample_bool_term<R: Rng>(&self, rng: &mut R) -> Term {
         // (uses, generation number, term)
         let mut terms = Vec::new();
         terms.extend(
@@ -128,29 +138,22 @@ impl Options {
             terms.push((0, terms.len(), leaf_term(Op::Const(Value::Bool(true)))));
             terms.push((0, terms.len(), leaf_term(Op::Const(Value::Bool(false)))));
         }
-        let mut rng = rand::rngs::StdRng::from_entropy();
-        if let Some(_) = self.seed {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            self.hash(&mut hasher);
-            let actual_seed = hasher.finish();
-            rng = rand::rngs::StdRng::seed_from_u64(actual_seed);
-        }
         let nary_arg_geo_param =
             self.nary_arg_geo_param_num as f64 / self.nary_arg_geo_param_denom as f64;
         let nary_arity_dist = Geometric::new(1.0 - nary_arg_geo_param).unwrap();
         let mut ops = vec![IMPLIES, NOT, XOR, AND, OR, EQ, ITE];
         ops.retain(|o| !self.omit_ops.contains(&format!("{}", o)));
         for _ in 0..(self.terms - 1) {
-            let op = ops.choose(&mut rng).unwrap().clone();
+            let op = ops.choose(rng).unwrap().clone();
             let arity = op.arity();
-            let n_args = arity.unwrap_or_else(|| 2 + nary_arity_dist.sample(&mut rng) as usize);
+            let n_args = arity.unwrap_or_else(|| 2 + nary_arity_dist.sample(rng) as usize);
             let mut args = Vec::new();
             for _ in 0..n_args {
                 let mut terms_cp = terms.clone();
                 let n = terms.len();
                 terms_cp.sort();
                 let weights: Vec<usize> = (0..n).map(|i| (n - i) * (n - i)).collect();
-                let choice = WeightedIndex::new(&weights).unwrap().sample(&mut rng);
+                let choice = WeightedIndex::new(&weights).unwrap().sample(rng);
                 let (_, i, t) = terms_cp[choice].clone();
                 args.push(t);
                 terms[i].0 += 1;
@@ -159,7 +162,7 @@ impl Options {
         }
         let mut nary_ops = vec![XOR, AND, OR];
         nary_ops.retain(|o| !self.omit_ops.contains(&format!("{}", o)));
-        let op = nary_ops.choose(&mut rng).unwrap().clone();
+        let op = nary_ops.choose(rng).unwrap().clone();
         term(
             op,
             terms
@@ -227,8 +230,14 @@ struct GeneratorOutput {
     constraints: usize,
 }
 
-trait Compiler {
-    fn compile(&self, bool_term: &Term, field: &FieldT, try_break: bool) -> CompilerOutput;
+trait Compiler<R: Rng> {
+    fn compile(
+        &self,
+        bool_term: &Term,
+        field: &FieldT,
+        try_break: bool,
+        rng: &mut R,
+    ) -> CompilerOutput;
 
     /// Generate a term that is SAT when the compilation is unsound.
     ///
@@ -237,9 +246,15 @@ trait Compiler {
     /// * `bool_term`: the term to compile
     /// * `field`: the field to compile it in
     /// * `try_break`: whether to try to break compilation, e.g. by omitting a constraint
-    fn gen_sound(&self, bool_term: &Term, field: &FieldT, try_break: bool) -> GeneratorOutput {
+    fn gen_sound(
+        &self,
+        bool_term: &Term,
+        field: &FieldT,
+        try_break: bool,
+        rng: &mut R,
+    ) -> GeneratorOutput {
         let start = Instant::now();
-        let o = self.compile(bool_term, field, try_break);
+        let o = self.compile(bool_term, field, try_break, rng);
         let compile_time = start.elapsed();
         let inputs_are_encoded = term(
             AND,
@@ -284,9 +299,10 @@ trait Compiler {
         bool_term: &Term,
         field: &FieldT,
         try_break: bool,
+        rng: &mut R,
     ) -> GeneratorOutput {
         let start = Instant::now();
-        let o = self.compile(bool_term, field, try_break);
+        let o = self.compile(bool_term, field, try_break, rng);
         let compile_time = start.elapsed();
         let inputs_terms: Vec<Term> = o
             .bool_vars_to_ff_vars
@@ -343,10 +359,16 @@ trait Compiler {
 mod zok {
     use super::*;
 
-    pub struct ZokRef;
+    pub struct ZokRef<R: Rng>(pub PhantomData<R>);
 
-    impl Compiler for ZokRef {
-        fn compile(&self, t: &Term, field: &FieldT, try_break: bool) -> CompilerOutput {
+    impl<R: Rng> Compiler<R> for ZokRef<R> {
+        fn compile(
+            &self,
+            t: &Term,
+            field: &FieldT,
+            try_break: bool,
+            rng: &mut R,
+        ) -> CompilerOutput {
             std::fs::write("z.zok", zok_code(&t)).unwrap();
             std::process::Command::new("zokrates")
                 .args(["compile", "-i", "z.zok", "-o", "out"])
@@ -363,7 +385,7 @@ mod zok {
             let mut vars: Vec<String> = extras::free_variables(t.clone()).into_iter().collect();
             vars.sort();
             let (ff_inputs, ff_assert, ff_ret, constraints) =
-                zok::parse_ztf("out.ztf", field, try_break);
+                zok::parse_ztf("out.ztf", field, try_break, rng);
             CompilerOutput {
                 bool_vars_to_ff_vars: vars.into_iter().zip(ff_inputs).collect(),
                 output_var: ff_ret,
@@ -490,10 +512,11 @@ mod zok {
     }
 
     /// Returns (ff input variables, assertion term, ff output variable)
-    pub fn parse_ztf(
+    pub fn parse_ztf<R: Rng>(
         path: &str,
         field: &FieldT,
-        drop_final: bool,
+        drop_random: bool,
+        rng: &mut R,
     ) -> (Vec<String>, Term, String, usize) {
         let contents = std::fs::read_to_string(path).unwrap();
         let mut lines = contents.lines().vcollect();
@@ -510,12 +533,14 @@ mod zok {
         let mut constraints = Vec::new();
         while let Some(l) = lines.pop() {
             if !(l.trim().starts_with("return") || l.trim().starts_with('#')) {
-                constraints.push(parse_constraint(l, field));
+                constraints.push(fold(&parse_constraint(l, field), &[]));
             }
         }
         let n = constraints.len();
-        if drop_final {
-            constraints.pop();
+        if drop_random {
+            let i = rng.gen_range(0..constraints.len());
+            println!("killing constraint {} {}", i, constraints[i]);
+            constraints.remove(i);
         }
         (vars, term(AND, constraints), "out".into(), n)
     }
@@ -524,9 +549,15 @@ mod zok {
 mod circ_ {
     use super::*;
 
-    pub struct CirC(pub bool, pub bool);
-    impl Compiler for CirC {
-        fn compile(&self, bool_term: &Term, field: &FieldT, try_break: bool) -> CompilerOutput {
+    pub struct CirC<R: Rng>(pub bool, pub bool, pub PhantomData<R>);
+    impl<R: Rng> Compiler<R> for CirC<R> {
+        fn compile(
+            &self,
+            bool_term: &Term,
+            field: &FieldT,
+            try_break: bool,
+            rng: &mut R,
+        ) -> CompilerOutput {
             let is_right =
                 term![EQ; bool_term.clone(), leaf_term(Op::Var("return".into(), Sort::Bool))];
             let mut c = Computation::default();
@@ -586,16 +617,13 @@ mod circ_ {
                 .find(|v| r1cs_var_name_to_orig_var_name(v) == "return")
                 .unwrap();
             let assertion = if try_break {
+                let i = rng.gen_range(0..r1cs_term.cs.len());
                 match &r1cs_term.op {
-                    &AND if r1cs_term.cs.len() > 1 => term(
-                        AND,
-                        r1cs_term
-                            .cs
-                            .iter()
-                            .take(r1cs_term.cs.len() - 1)
-                            .cloned()
-                            .collect(),
-                    ),
+                    &AND if r1cs_term.cs.len() > 1 => {
+                        let mut cs = r1cs_term.cs.clone();
+                        cs.remove(i);
+                        term(AND, cs)
+                    }
                     _ => r1cs_term,
                 }
             } else {
@@ -615,9 +643,15 @@ mod circ_ {
         r1cs_var_name[..i].into()
     }
 
-    pub struct CirCZok(pub bool, pub bool);
-    impl Compiler for CirCZok {
-        fn compile(&self, bool_term: &Term, field: &FieldT, try_break: bool) -> CompilerOutput {
+    pub struct CirCZok<R: Rng>(pub bool, pub bool, pub PhantomData<R>);
+    impl<R: Rng> Compiler<R> for CirCZok<R> {
+        fn compile(
+            &self,
+            bool_term: &Term,
+            field: &FieldT,
+            try_break: bool,
+            rng: &mut R,
+        ) -> CompilerOutput {
             if std::env::var("ZSHARP_STDLIB_PATH").is_err() {
                 eprintln!("Warning: ZSHARP_STDLIB_PATH is not set. This may cause an error.");
             }
@@ -674,16 +708,13 @@ mod circ_ {
                 .find(|v| r1cs_var_name_to_orig_var_name(v) == "return")
                 .unwrap();
             let assertion = if try_break {
+                let i = rng.gen_range(0..r1cs_term.cs.len());
                 match &r1cs_term.op {
-                    &AND if r1cs_term.cs.len() > 1 => term(
-                        AND,
-                        r1cs_term
-                            .cs
-                            .iter()
-                            .take(r1cs_term.cs.len() - 1)
-                            .cloned()
-                            .collect(),
-                    ),
+                    &AND if r1cs_term.cs.len() > 1 => {
+                        let mut cs = r1cs_term.cs.clone();
+                        cs.remove(i);
+                        term(AND, cs)
+                    }
                     _ => r1cs_term,
                 }
             } else {
@@ -984,9 +1015,11 @@ fn main() {
         .format_timestamp(None)
         .init();
     let opts = Options::from_args();
+    let rng = &mut rand::rngs::StdRng::from_entropy();
+    opts.seed_rng(rng);
     let t = opts.maybe_generate_nary().unwrap_or_else(|| {
         opts.maybe_read_ir_term()
-            .unwrap_or_else(|| opts.sample_bool_term())
+            .unwrap_or_else(|| opts.sample_bool_term(rng))
     });
     if let Some(path) = opts.ir_output.as_ref() {
         let mut f = File::create(path).expect("could not open IR file");
@@ -994,14 +1027,22 @@ fn main() {
         f.write_all(s.as_bytes()).unwrap();
     }
     let field = get_field(opts.field_bits);
-    let toolchain: Box<dyn Compiler> = match opts.toolchain {
-        Toolchain::ZokRef => Box::new(zok::ZokRef),
-        Toolchain::ZokCirC => Box::new(circ_::CirCZok(opts.circ_opt, opts.circ_opt_r1cs)),
-        Toolchain::CirC => Box::new(circ_::CirC(opts.circ_opt, opts.circ_opt_r1cs)),
+    let toolchain: Box<dyn Compiler<rand::rngs::StdRng>> = match opts.toolchain {
+        Toolchain::ZokRef => Box::new(zok::ZokRef(Default::default())),
+        Toolchain::ZokCirC => Box::new(circ_::CirCZok(
+            opts.circ_opt,
+            opts.circ_opt_r1cs,
+            Default::default(),
+        )),
+        Toolchain::CirC => Box::new(circ_::CirC(
+            opts.circ_opt,
+            opts.circ_opt_r1cs,
+            Default::default(),
+        )),
     };
     let gen = match opts.ty {
-        Type::Sound => toolchain.gen_sound(&t, &field, opts.try_break),
-        Type::Deterministic => toolchain.gen_deterministic(&t, &field, opts.try_break),
+        Type::Sound => toolchain.gen_sound(&t, &field, opts.try_break, rng),
+        Type::Deterministic => toolchain.gen_deterministic(&t, &field, opts.try_break, rng),
     };
     let formula = match opts.logic {
         Logic::FF => gen.should_be_unsat.clone(),
@@ -1015,7 +1056,7 @@ fn main() {
             }
         }
     };
-    let opt_formula = circ::ir::opt::cfold::fold(&formula, &[]);
+    let opt_formula = fold(&formula, &[]);
     println!("constraints: {}", gen.constraints);
     println!("comp   time: {}", gen.compile_time.as_secs_f64());
     let f = std::fs::File::create("out.smt2").unwrap();
