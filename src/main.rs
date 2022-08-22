@@ -21,6 +21,8 @@ use circ::ir::term::*;
 use circ::term;
 use circ_fields::FieldT;
 
+mod smt;
+
 #[derive(Debug, StructOpt, Hash)]
 #[structopt(
     name = "bench_gen",
@@ -1077,6 +1079,7 @@ fn main() {
     let opt_formula = fold(&formula, &[]);
     println!("constraints: {}", gen.constraints);
     println!("comp   time: {}", gen.compile_time.as_secs_f64());
-    let f = std::fs::File::create("out.smt2").unwrap();
-    circ::target::smt::write_smt2(f, &opt_formula);
+    let mut f = std::fs::File::create("out.smt2").unwrap();
+    smt::write_query(&mut f, &opt_formula);
+    //circ::target::smt::write_smt2(f, &opt_formula);
 }
