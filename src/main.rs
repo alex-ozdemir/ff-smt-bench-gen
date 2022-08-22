@@ -45,11 +45,6 @@ struct Options {
     nary_arg_geo_param_denom: usize,
     #[structopt(long, help = "Omit constant terms (true and false)")]
     no_consts: bool,
-    #[structopt(
-        long,
-        help = "Try to break compilation, e.g., by dropping a constraint"
-    )]
-    try_break: bool,
     #[structopt(long, help = "Enable CirC IR optimizations")]
     circ_opt: bool,
     #[structopt(long, help = "Enable CirC R1CS optimizations")]
@@ -73,6 +68,8 @@ struct Options {
     ty: Type,
     #[structopt(long, help = "Logic to use", default_value = "FF")]
     logic: Logic,
+    #[structopt(long, help = "Which constraint to drop", default_value = "none")]
+    drop: Drop,
     #[structopt(long, help = "for random generation")]
     seed: Option<u64>,
     #[structopt(
@@ -94,6 +91,15 @@ arg_enum! {
     enum Type {
         Sound,
         Deterministic,
+    }
+}
+
+arg_enum! {
+    #[derive(PartialEq, Debug, Hash)]
+    enum Drop {
+        None,
+        Random,
+        Last,
     }
 }
 
@@ -235,8 +241,8 @@ trait Compiler<R: Rng> {
         &self,
         bool_term: &Term,
         field: &FieldT,
-        try_break: bool,
-        rng: &mut R,
+        drop: bool,
+        rng: Option<&mut R>,
     ) -> CompilerOutput;
 
     /// Generate a term that is SAT when the compilation is unsound.
@@ -245,16 +251,17 @@ trait Compiler<R: Rng> {
     ///
     /// * `bool_term`: the term to compile
     /// * `field`: the field to compile it in
-    /// * `try_break`: whether to try to break compilation, e.g. by omitting a constraint
+    /// * `drop`: whether to try to break compilation, e.g. by omitting a constraint
+    /// * `rng`: rng to choose a random constraint. the last constraint if none.
     fn gen_sound(
         &self,
         bool_term: &Term,
         field: &FieldT,
-        try_break: bool,
-        rng: &mut R,
+        drop: bool,
+        rng: Option<&mut R>,
     ) -> GeneratorOutput {
         let start = Instant::now();
-        let o = self.compile(bool_term, field, try_break, rng);
+        let o = self.compile(bool_term, field, drop, rng);
         let compile_time = start.elapsed();
         let inputs_are_encoded = term(
             AND,
@@ -293,16 +300,16 @@ trait Compiler<R: Rng> {
     ///
     /// * `bool_term`: the term to compile
     /// * `field`: the field to compile it in
-    /// * `try_break`: whether to try to break compilation, e.g. by omitting a constraint
+    /// * `drop`: whether to try to break compilation, e.g. by omitting a constraint
     fn gen_deterministic(
         &self,
         bool_term: &Term,
         field: &FieldT,
-        try_break: bool,
-        rng: &mut R,
+        drop: bool,
+        rng: Option<&mut R>,
     ) -> GeneratorOutput {
         let start = Instant::now();
-        let o = self.compile(bool_term, field, try_break, rng);
+        let o = self.compile(bool_term, field, drop, rng);
         let compile_time = start.elapsed();
         let inputs_terms: Vec<Term> = o
             .bool_vars_to_ff_vars
@@ -366,8 +373,8 @@ mod zok {
             &self,
             t: &Term,
             field: &FieldT,
-            try_break: bool,
-            rng: &mut R,
+            drop: bool,
+            rng: Option<&mut R>,
         ) -> CompilerOutput {
             std::fs::write("z.zok", zok_code(&t)).unwrap();
             std::process::Command::new("zokrates")
@@ -385,7 +392,7 @@ mod zok {
             let mut vars: Vec<String> = extras::free_variables(t.clone()).into_iter().collect();
             vars.sort();
             let (ff_inputs, ff_assert, ff_ret, constraints) =
-                zok::parse_ztf("out.ztf", field, try_break, rng);
+                zok::parse_ztf("out.ztf", field, drop, rng);
             CompilerOutput {
                 bool_vars_to_ff_vars: vars.into_iter().zip(ff_inputs).collect(),
                 output_var: ff_ret,
@@ -516,7 +523,7 @@ mod zok {
         path: &str,
         field: &FieldT,
         drop_random: bool,
-        rng: &mut R,
+        rng: Option<&mut R>,
     ) -> (Vec<String>, Term, String, usize) {
         let contents = std::fs::read_to_string(path).unwrap();
         let mut lines = contents.lines().vcollect();
@@ -538,7 +545,9 @@ mod zok {
         }
         let n = constraints.len();
         if drop_random {
-            let i = rng.gen_range(0..constraints.len());
+            let i = rng
+                .map(|rng| rng.gen_range(0..constraints.len()))
+                .unwrap_or(constraints.len() - 1);
             println!("killing constraint {} {}", i, constraints[i]);
             constraints.remove(i);
         }
@@ -555,8 +564,8 @@ mod circ_ {
             &self,
             bool_term: &Term,
             field: &FieldT,
-            try_break: bool,
-            rng: &mut R,
+            drop: bool,
+            rng: Option<&mut R>,
         ) -> CompilerOutput {
             let is_right =
                 term![EQ; bool_term.clone(), leaf_term(Op::Var("return".into(), Sort::Bool))];
@@ -616,8 +625,10 @@ mod circ_ {
                 .into_iter()
                 .find(|v| r1cs_var_name_to_orig_var_name(v) == "return")
                 .unwrap();
-            let assertion = if try_break {
-                let i = rng.gen_range(0..r1cs_term.cs.len());
+            let assertion = if drop {
+                let i = rng
+                    .map(|rng| rng.gen_range(0..r1cs_term.cs.len()))
+                    .unwrap_or(r1cs_term.cs.len() - 1);
                 match &r1cs_term.op {
                     &AND if r1cs_term.cs.len() > 1 => {
                         let mut cs = r1cs_term.cs.clone();
@@ -649,8 +660,8 @@ mod circ_ {
             &self,
             bool_term: &Term,
             field: &FieldT,
-            try_break: bool,
-            rng: &mut R,
+            drop: bool,
+            rng: Option<&mut R>,
         ) -> CompilerOutput {
             if std::env::var("ZSHARP_STDLIB_PATH").is_err() {
                 eprintln!("Warning: ZSHARP_STDLIB_PATH is not set. This may cause an error.");
@@ -707,8 +718,10 @@ mod circ_ {
                 .into_iter()
                 .find(|v| r1cs_var_name_to_orig_var_name(v) == "return")
                 .unwrap();
-            let assertion = if try_break {
-                let i = rng.gen_range(0..r1cs_term.cs.len());
+            let assertion = if drop {
+                let i = rng
+                    .map(|rng| rng.gen_range(0..r1cs_term.cs.len()))
+                    .unwrap_or(r1cs_term.cs.len() - 1);
                 match &r1cs_term.op {
                     &AND if r1cs_term.cs.len() > 1 => {
                         let mut cs = r1cs_term.cs.clone();
@@ -1040,9 +1053,14 @@ fn main() {
             Default::default(),
         )),
     };
+    let (drop, rng_opt) = match opts.drop {
+        Drop::None => (false, None),
+        Drop::Last => (true, None),
+        Drop::Random => (true, Some(rng)),
+    };
     let gen = match opts.ty {
-        Type::Sound => toolchain.gen_sound(&t, &field, opts.try_break, rng),
-        Type::Deterministic => toolchain.gen_deterministic(&t, &field, opts.try_break, rng),
+        Type::Sound => toolchain.gen_sound(&t, &field, drop, rng_opt),
+        Type::Deterministic => toolchain.gen_deterministic(&t, &field, drop, rng_opt),
     };
     let formula = match opts.logic {
         Logic::FF => gen.should_be_unsat.clone(),
