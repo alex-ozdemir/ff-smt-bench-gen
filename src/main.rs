@@ -76,12 +76,14 @@ struct Options {
     seed: Option<u64>,
     #[structopt(
         long,
-        help = "Generate an n-ary operator. Takes precendence over random generation."
+        help = "Generate an n-ary operator. Takes precendence over random generation.",
+        value_name = "operator",
     )]
     gen_nary: Option<String>,
     #[structopt(
         long,
-        help = "IR to compile. Takes precendence over other generation procedures."
+        help = "IR to compile. Takes precendence over other generation procedures.",
+        value_name = "path",
     )]
     ir: Option<String>,
     #[structopt(long, help = "Dump the IR to this file.")]
