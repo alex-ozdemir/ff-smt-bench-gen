@@ -124,6 +124,7 @@ impl<'a, W: 'a + Write> Printer<'a, W> {
                 | Op::BvNaryOp(_)
                 | Op::BvUnOp(_)
                 | Op::Var(..)
+                | Op::Ite
                 | Op::Eq => Some(format!("{}", sub_t.op)),
                 _ => unimplemented!("op in term: {}", sub_t),
             };
