@@ -83,7 +83,7 @@ done
 
 for vars in 2; do
     for terms in 4; do
-        for bits in 4 5 6 7 8 9 10; do
+        for bits in 4 5 6 7 8 9 10 11 12; do
             for theory in ff; do
                 for drop in none last random; do
                     for ty in sound deterministic; do
@@ -116,7 +116,7 @@ done
 
 for vars in 4; do
     for terms in 8; do
-        for bits in 5 10 15 20 25 30; do
+        for bits in 5 10 15 20 25 30 35 40 45 50 55 60; do
             for theory in ff bv; do
                 for drop in none last random; do
                     for ty in sound deterministic; do

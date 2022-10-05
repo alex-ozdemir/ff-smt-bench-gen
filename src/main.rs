@@ -77,13 +77,13 @@ struct Options {
     #[structopt(
         long,
         help = "Generate an n-ary operator. Takes precendence over random generation.",
-        value_name = "operator",
+        value_name = "operator"
     )]
     gen_nary: Option<String>,
     #[structopt(
         long,
         help = "IR to compile. Takes precendence over other generation procedures.",
-        value_name = "path",
+        value_name = "path"
     )]
     ir: Option<String>,
     #[structopt(long, help = "Dump the IR to this file.")]
@@ -91,7 +91,7 @@ struct Options {
 }
 
 arg_enum! {
-    #[derive(PartialEq, Debug, Hash)]
+    #[derive(PartialEq, Clone, Debug, Hash)]
     enum Type {
         Sound,
         Deterministic,
@@ -126,7 +126,19 @@ arg_enum! {
     }
 }
 
-impl Options {
+#[derive(Debug, Hash)]
+struct FormulaDistParams {
+    terms: usize,
+    vars: usize,
+    nary_arg_geo_param_num: usize,
+    nary_arg_geo_param_denom: usize,
+    no_consts: bool,
+    omit_ops: Vec<String>,
+    ty: Type,
+    seed: Option<u64>,
+}
+
+impl FormulaDistParams {
     fn seed_rng<R: SeedableRng>(&self, rng: &mut R) {
         if let Some(_) = self.seed {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -181,6 +193,29 @@ impl Options {
                 .map(|i| i.2)
                 .collect(),
         )
+    }
+}
+
+impl Options {
+    fn seed_rng<R: SeedableRng>(&self, rng: &mut R) {
+        if let Some(_) = self.seed {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            self.hash(&mut hasher);
+            let actual_seed = hasher.finish();
+            *rng = R::seed_from_u64(actual_seed);
+        }
+    }
+    fn to_formula_dist_params(&self) -> FormulaDistParams {
+        FormulaDistParams {
+            terms: self.terms.clone(),
+            vars: self.vars.clone(),
+            nary_arg_geo_param_num: self.nary_arg_geo_param_num.clone(),
+            nary_arg_geo_param_denom: self.nary_arg_geo_param_denom.clone(),
+            no_consts: self.no_consts.clone(),
+            omit_ops: self.omit_ops.clone(),
+            ty: self.ty.clone(),
+            seed: self.seed.clone(),
+        }
     }
     fn maybe_read_ir_term(&self) -> Option<Term> {
         self.ir.as_ref().map(|path| {
@@ -1033,11 +1068,14 @@ fn main() {
         .init();
     let opts = Options::from_args();
     let rng = &mut rand::rngs::StdRng::from_entropy();
-    opts.seed_rng(rng);
     let t = opts.maybe_generate_nary().unwrap_or_else(|| {
-        opts.maybe_read_ir_term()
-            .unwrap_or_else(|| opts.sample_bool_term(rng))
+        opts.maybe_read_ir_term().unwrap_or_else(|| {
+            let ps = opts.to_formula_dist_params();
+            ps.seed_rng(rng);
+            ps.sample_bool_term(rng)
+        })
     });
+    opts.seed_rng(rng);
     if let Some(path) = opts.ir_output.as_ref() {
         let mut f = File::create(path).expect("could not open IR file");
         let s = text::serialize_term(&t);
