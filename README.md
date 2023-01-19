@@ -5,9 +5,10 @@ boolean formulae.
 
 ## Instructions
 
-1. Clone this repository `git clone https://github.com/alex-ozdemir/ff-smt-bench-gen.git`
-2. Clone the CirC repository `git clone https://github.com/circify/circ.git`
-3. Run this binary with the `ZSHARP_STDLIB_PATH` set to a path to `third_party/ZoKrates/zokrates_stdlib` in the CirC clone.
+1. Install ZoKrates [link](https://zokrates.github.io/gettingstarted.html)
+2. Clone this repository `git clone https://github.com/alex-ozdemir/ff-smt-bench-gen.git`
+3. Clone the CirC repository `git clone https://github.com/circify/circ.git`
+4. Run this binary with the `ZSHARP_STDLIB_PATH` set to a path to `third_party/ZoKrates/zokrates_stdlib` in the CirC clone.
 
 Example run:
 
