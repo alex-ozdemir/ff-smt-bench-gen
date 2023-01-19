@@ -7,10 +7,9 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-#circ = { path = "../../../../llcl/circ", features = ["smt", "r1cs", "zok"]}
-#circ_fields = { path = "../../../../llcl/circ/circ_fields" }
 circ = { git = "https://github.com/circify/circ.git", branch = "master", features = ["smt", "r1cs", "zok"]}
 circ_fields = { git = "https://github.com/circify/circ.git", branch = "master"}
+circ_opt = { git = "https://github.com/circify/circ.git", branch = "master"}
 rand = "0.8"
 rand_distr = "0.4"
 structopt = "0.3"

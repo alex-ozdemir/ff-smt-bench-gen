@@ -198,9 +198,9 @@ impl FormulaDistParams {
 
 impl Options {
     fn seed_rng<R: SeedableRng>(&self, rng: &mut R) {
-        if let Some(_) = self.seed {
+        if let Some(s) = self.seed {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            self.hash(&mut hasher);
+            s.hash(&mut hasher);
             let actual_seed = hasher.finish();
             *rng = R::seed_from_u64(actual_seed);
         }
@@ -365,9 +365,9 @@ trait Compiler<R: Rng> {
                 ))
             })
             .collect();
-        let mut terms_alt: TermMap<Term> = TermMap::new();
+        let mut terms_alt: TermMap<Term> = TermMap::default();
         for t in PostOrderIter::new(o.assertion.clone()) {
-            if let Op::Var(n, s) = &t.op {
+            if let Op::Var(n, s) = t.op() {
                 terms_alt.insert(
                     t.clone(),
                     leaf_term(Op::Var(format!("{}_alt", n.clone()), s.clone())),
@@ -456,11 +456,11 @@ mod zok {
             }
         }
         writeln!(&mut out, ") -> bool:").unwrap();
-        let mut names: TermMap<String> = TermMap::new();
+        let mut names: TermMap<String> = TermMap::default();
         let mut i = 0;
         for t in PostOrderIter::new(t.clone()) {
-            let get = |i: usize| names.get(&t.cs[i]).unwrap();
-            let expr = match &t.op {
+            let get = |i: usize| names.get(&t.cs()[i]).unwrap();
+            let expr = match t.op() {
                 Op::Var(name, _) => name.clone(),
                 Op::Const(..) => format!("{}", t),
                 Op::Implies => format!("!{} || {}", get(0), get(1)),
@@ -469,26 +469,26 @@ mod zok {
                 Op::Ite => format!("if {} then {} else {} fi", get(0), get(1), get(2)),
                 Op::BoolNaryOp(BoolNaryOp::Or) => {
                     let mut out = format!("{}", get(0));
-                    for i in 1..t.cs.len() {
+                    for i in 1..t.cs().len() {
                         out += &format!(" || {}", get(i));
                     }
                     out
                 }
                 Op::BoolNaryOp(BoolNaryOp::And) => {
                     let mut out = format!("{}", get(0));
-                    for i in 1..t.cs.len() {
+                    for i in 1..t.cs().len() {
                         out += &format!(" && {}", get(i));
                     }
                     out
                 }
                 Op::BoolNaryOp(BoolNaryOp::Xor) => {
                     let mut out = format!("{}", get(0));
-                    for i in 1..t.cs.len() {
+                    for i in 1..t.cs().len() {
                         out += &format!(" ^ {}", get(i));
                     }
                     out
                 }
-                _ => unreachable!("op {}", t.op),
+                _ => unreachable!("op {}", t.op()),
             };
             let name = format!("let{}", i);
             i += 1;
@@ -619,12 +619,14 @@ mod circ_ {
                 );
             }
             c.outputs.push(is_right);
-            let c = if self.0 {
-                c
+            let mut cs = Computations::new();
+            cs.comps.insert("main".into(), c);
+            let cs = if self.0 {
+                cs
             } else {
                 use circ::ir::opt::Opt;
                 circ::ir::opt::opt(
-                    c,
+                    cs,
                     vec![
                         Opt::ScalarizeVars,
                         Opt::Flatten,
@@ -647,9 +649,12 @@ mod circ_ {
                     ],
                 )
             };
-            let (mut r1cs, _, _) = circ::target::r1cs::trans::to_r1cs(c, field.clone());
+            let mut opt = circ::cfg::CircOpt::default();
+            opt.field.custom_modulus = field.modulus().to_string();
+            let cfg = circ::cfg::CircCfg::from(opt);
+            let mut r1cs = circ::target::r1cs::trans::to_r1cs(cs.get("main").clone(), &cfg).0.r1cs;
             if self.1 {
-                r1cs = circ::target::r1cs::opt::reduce_linearities(r1cs, Some(50));
+                r1cs = circ::target::r1cs::opt::reduce_linearities(r1cs, &cfg);
             }
             let constraints = r1cs.constraints().len();
             let r1cs_term = r1cs.ir_term();
@@ -666,11 +671,11 @@ mod circ_ {
                 .unwrap();
             let assertion = if drop {
                 let i = rng
-                    .map(|rng| rng.gen_range(0..r1cs_term.cs.len()))
-                    .unwrap_or(r1cs_term.cs.len() - 1);
-                match &r1cs_term.op {
-                    &AND if r1cs_term.cs.len() > 1 => {
-                        let mut cs = r1cs_term.cs.clone();
+                    .map(|rng| rng.gen_range(0..r1cs_term.cs().len()))
+                    .unwrap_or(r1cs_term.cs().len() - 1);
+                match r1cs_term.op() {
+                    &AND if r1cs_term.cs().len() > 1 => {
+                        let mut cs = r1cs_term.cs().to_owned();
                         cs.remove(i);
                         term(AND, cs)
                     }
@@ -706,10 +711,13 @@ mod circ_ {
                 eprintln!("Warning: ZSHARP_STDLIB_PATH is not set. This may cause an error.");
             }
             std::fs::write("z.zok", zok::zok_code(&bool_term)).unwrap();
+            let mut opt = circ::cfg::CircOpt::default();
+            opt.field.custom_modulus = field.modulus().to_string();
+            let cfg = circ::cfg::CircCfg::from(opt);
+            circ::cfg::set(&cfg);
             let inputs = circ::front::zsharp::Inputs {
                 file: "z.zok".into(),
                 mode: circ::front::Mode::Proof,
-                isolate_asserts: false,
             };
             let c = circ::front::zsharp::ZSharpFE::gen(inputs);
             let c = if self.0 {
@@ -740,9 +748,9 @@ mod circ_ {
                     ],
                 )
             };
-            let (mut r1cs, _, _) = circ::target::r1cs::trans::to_r1cs(c, field.clone());
+            let mut r1cs = circ::target::r1cs::trans::to_r1cs(c.get("main").clone(), &cfg).0.r1cs;
             if self.1 {
-                r1cs = circ::target::r1cs::opt::reduce_linearities(r1cs, Some(50));
+                r1cs = circ::target::r1cs::opt::reduce_linearities(r1cs, &cfg);
             }
             let constraints = r1cs.constraints().len();
             let r1cs_term = r1cs.ir_term();
@@ -759,11 +767,11 @@ mod circ_ {
                 .unwrap();
             let assertion = if drop {
                 let i = rng
-                    .map(|rng| rng.gen_range(0..r1cs_term.cs.len()))
-                    .unwrap_or(r1cs_term.cs.len() - 1);
-                match &r1cs_term.op {
-                    &AND if r1cs_term.cs.len() > 1 => {
-                        let mut cs = r1cs_term.cs.clone();
+                    .map(|rng| rng.gen_range(0..r1cs_term.cs().len()))
+                    .unwrap_or(r1cs_term.cs().len() - 1);
+                match r1cs_term.op() {
+                    &AND if r1cs_term.cs().len() > 1 => {
+                        let mut cs = r1cs_term.cs().to_owned();
                         cs.remove(i);
                         term(AND, cs)
                     }
@@ -846,11 +854,11 @@ fn pf_to_bv_lazy(formula: Term, f: &FieldT) -> Term {
     let f_bits = f.modulus().significant_bits() as usize;
     let bv_sort = Sort::BitVector(f_bits);
     let bv_modulus = bv_lit(f.modulus(), f_bits);
-    let mut cache: TermMap<Term> = TermMap::new();
+    let mut cache: TermMap<Term> = TermMap::default();
     let mut assertions = Vec::new();
     for t in PostOrderIter::new(formula.clone()) {
-        let cs: Vec<Term> = t.cs.iter().map(|c| cache.get(c).unwrap().clone()).collect();
-        let new = match &t.op {
+        let cs: Vec<Term> = t.cs().iter().map(|c| cache.get(c).unwrap().clone()).collect();
+        let new = match t.op() {
             Op::Const(Value::Field(c)) => {
                 assert_eq!(&c.ty(), f);
                 bv_lit(c.i(), f_bits)
@@ -863,7 +871,7 @@ fn pf_to_bv_lazy(formula: Term, f: &FieldT) -> Term {
             }
             Op::PfNaryOp(PfNaryOp::Add) => bv_safe_add(&cs),
             Op::PfNaryOp(PfNaryOp::Mul) => cs.into_iter().reduce(|a, b| bv_safe_mul(a, b)).unwrap(),
-            Op::Eq => match check(&t.cs[0]) {
+            Op::Eq => match check(&t.cs()[0]) {
                 Sort::Field(_) => bv_safe_ff_eq(cs[0].clone(), cs[1].clone(), f),
                 _ => term(EQ, cs),
             },
@@ -880,11 +888,11 @@ fn pf_to_bv(formula: Term, f: &FieldT) -> Term {
     let f_bits = f.modulus().significant_bits() as usize;
     let bv_sort = Sort::BitVector(2 * f_bits);
     let bv_modulus = bv_lit(f.modulus(), 2 * f_bits);
-    let mut cache: TermMap<Term> = TermMap::new();
+    let mut cache: TermMap<Term> = TermMap::default();
     let mut assertions = Vec::new();
     for t in PostOrderIter::new(formula.clone()) {
-        let cs: Vec<Term> = t.cs.iter().map(|c| cache.get(c).unwrap().clone()).collect();
-        let new = match &t.op {
+        let cs: Vec<Term> = t.cs().iter().map(|c| cache.get(c).unwrap().clone()).collect();
+        let new = match t.op() {
             Op::Const(Value::Field(c)) => {
                 assert_eq!(&c.ty(), f);
                 bv_lit(c.i(), 2 * f_bits)
@@ -932,10 +940,10 @@ fn pf_to_nia(formula: Term, f: &FieldT) -> Term {
             .push(term![EQ; t, term![INT_ADD; term![INT_MUL; q, int_modulus.clone()], r.clone()]]);
         r
     };
-    let mut cache: TermMap<Term> = TermMap::new();
+    let mut cache: TermMap<Term> = TermMap::default();
     for t in PostOrderIter::new(formula.clone()) {
-        let cs: Vec<Term> = t.cs.iter().map(|c| cache.get(c).unwrap().clone()).collect();
-        let new = match &t.op {
+        let cs: Vec<Term> = t.cs().iter().map(|c| cache.get(c).unwrap().clone()).collect();
+        let new = match t.op() {
             Op::Const(Value::Field(c)) => {
                 assert_eq!(&c.ty(), f);
                 leaf_term(Op::Const(Value::Int(c.i().clone())))
@@ -973,11 +981,11 @@ fn pf_bool_neg(t: Term) -> Term {
 fn bool_to_pf(formula: Term, f: &FieldT) -> Term {
     let mut ct = 0;
     let formula = circ::ir::opt::flat::flatten_nary_ops(formula);
-    if &formula.op == &AND {
+    if formula.op() == &AND {
         term(
             AND,
             formula
-                .cs
+                .cs()
                 .iter()
                 .map(|t| bool_to_pf_pure(t.clone(), f, &mut ct))
                 .collect(),
@@ -989,7 +997,7 @@ fn bool_to_pf(formula: Term, f: &FieldT) -> Term {
 
 fn bool_to_pf_pure(formula: Term, f: &FieldT, ct: &mut usize) -> Term {
     let f_sort = Sort::Field(f.clone());
-    let mut cache: TermMap<Term> = TermMap::new();
+    let mut cache: TermMap<Term> = TermMap::default();
     let mut assertions = Vec::new();
     let mut fresh = || {
         let v = leaf_term(Op::Var(format!("embed_i{}", ct), f_sort.clone()));
@@ -997,8 +1005,8 @@ fn bool_to_pf_pure(formula: Term, f: &FieldT, ct: &mut usize) -> Term {
         v
     };
     for t in PostOrderIter::new(formula.clone()) {
-        let cs: Vec<Term> = t.cs.iter().map(|c| cache.get(c).unwrap().clone()).collect();
-        let new = match &t.op {
+        let cs: Vec<Term> = t.cs().iter().map(|c| cache.get(c).unwrap().clone()).collect();
+        let new = match t.op() {
             Op::Const(Value::Bool(b)) => pf_lit(f.new_v(*b as u8)),
             Op::Var(name, Sort::Bool) => {
                 let v = leaf_term(Op::Var(name.clone(), f_sort.clone()));
@@ -1014,7 +1022,7 @@ fn bool_to_pf_pure(formula: Term, f: &FieldT, ct: &mut usize) -> Term {
             }
             Op::Implies => pf_bool_neg(term![PF_MUL; cs[0].clone(), pf_bool_neg(cs[1].clone())]),
             Op::Eq => {
-                match check(&t.cs[0]) {
+                match check(&t.cs()[0]) {
                     Sort::Bool => {
                         // 1 - x - y + 2 * xy
                         term![PF_ADD;

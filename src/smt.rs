@@ -81,7 +81,7 @@ impl<'a, W: 'a + Write> Printer<'a, W> {
 
     fn declare_vars(&mut self, t: Term) {
         for sub_t in PostOrderIter::new(t) {
-            if let Op::Var(name, sort) = &sub_t.op {
+            if let Op::Var(name, sort) = &sub_t.op() {
                 writeln!(
                     &mut self.writer,
                     "(declare-fun {} () {})",
@@ -98,7 +98,7 @@ impl<'a, W: 'a + Write> Printer<'a, W> {
         for sub_t in PostOrderIter::new(t.clone()) {
             let name = format!("let{}", self.n_terms);
             self.n_terms += 1;
-            let op: Option<String> = match &sub_t.op {
+            let op: Option<String> = match sub_t.op() {
                 &PF_ADD => Some("ff.add".into()),
                 &PF_MUL => Some("ff.mul".into()),
                 &PF_NEG => Some("ff.neg".into()),
@@ -125,16 +125,16 @@ impl<'a, W: 'a + Write> Printer<'a, W> {
                 | Op::BvUnOp(_)
                 | Op::Var(..)
                 | Op::Ite
-                | Op::Eq => Some(format!("{}", sub_t.op)),
+                | Op::Eq => Some(format!("{}", sub_t.op())),
                 _ => unimplemented!("op in term: {}", sub_t),
             };
             if let Some(op) = op {
                 close += 1;
-                if sub_t.op.arity() == Some(0) {
+                if sub_t.op().arity() == Some(0) {
                     writeln!(&mut self.writer, "  (let (({} {}))", name, op).unwrap();
                 } else {
                     write!(&mut self.writer, "  (let (({} ({}", name, op).unwrap();
-                    for c in &sub_t.cs {
+                    for c in sub_t.cs() {
                         write!(&mut self.writer, " {}", self.term_reprs.get(c).unwrap()).unwrap();
                     }
                     writeln!(&mut self.writer, ")))").unwrap();
